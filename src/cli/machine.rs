@@ -267,6 +267,9 @@ pub enum MachineCmd {
     /// Fork a running forkable machine into a new clone (CoW memory + disks)
     Fork(ForkCmd),
 
+    /// Assign parameters and release one held fork-pool slot
+    ForkRelease(ForkReleaseCmd),
+
     /// Stop a running machine
     Stop(StopCmd),
 
@@ -337,6 +340,7 @@ impl MachineCmd {
             MachineCmd::Create(cmd) => cmd.run(),
             MachineCmd::Start(cmd) => cmd.run(),
             MachineCmd::Fork(cmd) => cmd.run(),
+            MachineCmd::ForkRelease(cmd) => cmd.run(),
             MachineCmd::Stop(cmd) => cmd.run(),
             MachineCmd::Delete(cmd) => cmd.run(),
             MachineCmd::Status(cmd) => cmd.run(),
@@ -531,6 +535,11 @@ pub struct RunCmd {
     #[arg(long, help_heading = "Hardware")]
     pub cuda: bool,
 
+    /// Ask compatible CUDA frameworks to graph safe compiled regions.
+    /// Implies --cuda; arbitrary eager CUDA calls are not captured.
+    #[arg(long, help_heading = "Hardware")]
+    pub auto_graph: bool,
+
     /// Expose the guest's Docker daemon socket to the host as a Unix socket
     /// (DOCKER_HOST=unix://…). Requires dockerd running in the VM.
     #[arg(long, help_heading = "Network")]
@@ -568,6 +577,14 @@ pub struct RunCmd {
     #[arg(long, help_heading = "Resources")]
     pub rebuild_init_cache: bool,
 
+    /// Cache the pulled OCI image on the host so repeat ephemeral runs of the same
+    /// `--image` skip the registry pull. The image is baked once into a reusable
+    /// `.smolmachine` (keyed by image + env) and every later run rehydrates from it
+    /// instead of re-pulling inside the guest. The VM stays throwaway; only the
+    /// image is cached. Registry images only.
+    #[arg(long, help_heading = "Resources")]
+    pub oci_cache: bool,
+
     /// Run the workload as an unprivileged container: restricted capabilities,
     /// read-only cgroup, and no extra tmpfs. By default the workload is "VM-grade"
     /// (the microVM is the isolation boundary, so it gets full privileges and any
@@ -599,6 +616,15 @@ fn init_cache_max_bytes() -> u64 {
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT)
+}
+
+/// Bump a cache entry's modification time to now so the LRU prune treats it as
+/// recently used. Best-effort and cross-platform (`File::set_modified`); a
+/// failure just leaves the old mtime, which at worst evicts a hot entry sooner.
+fn touch_cache_entry(path: &Path) {
+    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
+        let _ = f.set_modified(std::time::SystemTime::now());
+    }
 }
 
 /// Evict least-recently-modified cached layers until the cache is at or below
@@ -668,12 +694,27 @@ fn gc_stale_bake_machines(exe: &Path) {
 /// Content key for an init layer: a hash of the image + init commands + env, so the
 /// cache rebuilds exactly when those inputs change.
 ///
+/// When `digest` is supplied (the `--oci-cache` path resolves it at the auth
+/// gate) it is mixed in, so the key pins the image's CONTENT rather than its
+/// reference string. Without it, `alpine:latest` would hash the same forever and
+/// a cached entry would keep serving the image as it was on the first run — the
+/// tag moving upstream (including for a security fix) would never be picked up.
+///
 /// PROTOTYPE LIMITATION: if `init` runs a script that lives on a mounted volume
 /// (e.g. `bash /project/init.sh`), the script's CONTENTS are not part of the key —
 /// inline the init steps into the Smolfile, or pass `--no-init-cache`.
-fn init_layer_key(image: Option<&str>, init: &[String], env: &[String]) -> String {
+fn init_layer_key(
+    image: Option<&str>,
+    init: &[String],
+    env: &[String],
+    digest: Option<&str>,
+) -> String {
     let mut h = Sha256::new();
     h.update(image.unwrap_or("").as_bytes());
+    h.update([0u8]);
+    if let Some(d) = digest {
+        h.update(d.as_bytes());
+    }
     h.update([0u8]);
     for c in init {
         h.update(c.as_bytes());
@@ -709,31 +750,49 @@ fn ensure_init_layer(
     params: &vm_common::CreateVmParams,
     smolfile: Option<&Path>,
     rebuild: bool,
+    digest: Option<&str>,
 ) -> smolvm::Result<PathBuf> {
     // The bake here only ever receives a registry image: `ensure_init_layer` is
     // gated on `image_bakeable()` (local archives/dirs take the direct path),
     // because the `pack create --from-vm` snapshot below cannot source a local
     // image's layers (they're flattened, with no registry manifest to pull).
-    let key = init_layer_key(params.image.as_deref(), &params.init, &params.env);
+    let key = init_layer_key(params.image.as_deref(), &params.init, &params.env, digest);
     let dir = init_layer_cache_dir();
     std::fs::create_dir_all(&dir)
         .map_err(|e| smolvm::Error::config("init-layer cache", e.to_string()))?;
     let cached = dir.join(format!("{key}.smolmachine"));
     if cached.exists() && !rebuild {
-        println!("Using cached init layer {key}");
+        if params.init.is_empty() {
+            println!("Using cached image {key} (host cache hit; no pull)");
+        } else {
+            println!("Using cached init layer {key}");
+        }
+        // Mark the entry recently used (bump mtime) so the LRU sweep keeps hot
+        // images and evicts cold ones — without this a frequently-run cached image
+        // could be evicted just for having an old bake time. Then bound the cache
+        // on the hit path too, not only after a bake. Both best-effort.
+        touch_cache_entry(&cached);
+        prune_init_cache(&dir, init_cache_max_bytes(), &cached);
         return Ok(cached);
     }
 
-    let smolfile = smolfile.ok_or_else(|| {
-        smolvm::Error::config(
+    // The Smolfile is the source of init commands, so it's required only when there
+    // ARE init steps. A bare `--oci-cache` image (no init) bakes from `--image`
+    // alone and needs no Smolfile.
+    if !params.init.is_empty() && smolfile.is_none() {
+        return Err(smolvm::Error::config(
             "init-layer cache",
             "init caching requires a --smolfile (the init source); pass --no-init-cache otherwise",
-        )
-    })?;
-    println!(
-        "Baking init layer (one-time; reused on later runs) [{key}, {} init step(s)]",
-        params.init.len()
-    );
+        ));
+    }
+    if params.init.is_empty() {
+        println!("Caching image {key} (one-time; reused on later runs)");
+    } else {
+        println!(
+            "Baking init layer (one-time; reused on later runs) [{key}, {} init step(s)]",
+            params.init.len()
+        );
+    }
     let started = std::time::Instant::now();
 
     let exe = std::env::current_exe()
@@ -743,7 +802,6 @@ fn ensure_init_layer(
     gc_stale_bake_machines(&exe);
     let pid = std::process::id();
     let tmp = format!("init-bake-{key}-{pid}");
-    let sf = smolfile.to_string_lossy().to_string();
 
     // Bake into a per-process staging dir, then atomically rename the sidecar into
     // its final cache path. This makes an interrupted bake leave nothing usable (no
@@ -767,10 +825,14 @@ fn ensure_init_layer(
         // `/bin/true` so `start` runs init only. Forward the RESOLVED image and env
         // (CLI overrides included) so the baked rootfs matches the cache key, which
         // is derived from those same resolved params.
-        let mut create: Vec<String> = ["machine", "create", "--name", &tmp, "--smolfile", &sf]
+        let mut create: Vec<String> = ["machine", "create", "--name", &tmp]
             .iter()
             .map(|s| s.to_string())
             .collect();
+        if let Some(sf) = smolfile {
+            create.push("--smolfile".into());
+            create.push(sf.to_string_lossy().to_string());
+        }
         if let Some(image) = &params.image {
             create.push("--image".into());
             create.push(image.clone());
@@ -778,6 +840,24 @@ fn ensure_init_layer(
         for e in &params.env {
             create.push("-e".into());
             create.push(e.clone());
+        }
+        // Forward the run's network config so the bake's one-time in-guest pull can
+        // reach the registry. The cached artifact carries the layers, so later runs
+        // from it need no network to source the image.
+        if params.net {
+            create.push("--net".into());
+        }
+        if let Some(dns) = params.dns {
+            create.push("--dns".into());
+            create.push(dns.to_string());
+        }
+        for c in params.allowed_cidrs.iter().flatten() {
+            create.push("--allow-cidr".into());
+            create.push(c.clone());
+        }
+        for h in params.dns_filter_hosts.iter().flatten() {
+            create.push("--allow-host".into());
+            create.push(h.clone());
         }
         create.push("--".into());
         create.push("/bin/true".into());
@@ -869,6 +949,10 @@ impl RunCmd {
         // flags pass through. Flags the sidecar runner can't honor are rejected
         // at parse time via `conflicts_with_all` on `from`.
         if let Some(from) = self.from {
+            let mut env = self.env;
+            if self.auto_graph {
+                smolvm::util::enable_cuda_auto_graph_env_specs(&mut env);
+            }
             return crate::cli::pack_run::PackRunCmd {
                 sidecar: Some(from),
                 command: self.command,
@@ -876,7 +960,7 @@ impl RunCmd {
                 tty: self.tty,
                 timeout: self.timeout,
                 workdir: self.workdir,
-                env: self.env,
+                env,
                 volume: self.volume,
                 port: self.port,
                 net: self.net,
@@ -888,7 +972,8 @@ impl RunCmd {
                 force_extract: false,
                 info: false,
                 debug: false,
-                cuda: false,
+                cuda: self.cuda,
+                auto_graph: self.auto_graph,
             }
             .run();
         }
@@ -942,6 +1027,10 @@ impl RunCmd {
         )?;
 
         let mut params = params;
+        if self.auto_graph {
+            smolvm::util::enable_cuda_auto_graph_env_specs(&mut params.env);
+            params.cuda = true;
+        }
         params.dns_filter_hosts = match (params.dns_filter_hosts.take(), cli_dns_filter_hosts) {
             (Some(mut from_smolfile), Some(mut from_cli)) => {
                 from_smolfile.append(&mut from_cli);
@@ -1003,7 +1092,8 @@ impl RunCmd {
                     force_extract: false,
                     info: false,
                     debug: false,
-                    cuda: false,
+                    cuda: self.cuda || params.cuda,
+                    auto_graph: self.auto_graph,
                 }
                 .run();
             }
@@ -1021,13 +1111,60 @@ impl RunCmd {
         // `--image -` archive can't be re-read by the bake's child subprocess
         // (null stdin) anyway. Local images take the direct path below, which
         // stages the archive once in this process and runs init inline (#459).
+        // The cache normally applies to runs with `init` steps (bake `image + init`
+        // once). `--oci-cache` extends it to a bare `--image` run with no init, so
+        // the OCI image itself is cached on the host and repeat ephemeral runs skip
+        // the pull — the same bake path, just with an empty init layer.
         if !self.no_init_cache
             && !self.detach
             && image_bakeable(params.image.as_deref())
-            && !params.init.is_empty()
+            && (!params.init.is_empty() || self.oci_cache)
         {
-            let cached =
-                ensure_init_layer(&params, self.smolfile.as_deref(), self.rebuild_init_cache)?;
+            // `--oci-cache` needs an explicit workload for the same reason the
+            // non-cached path does: with no command the baked artifact's own
+            // entrypoint is a `/bin/true` no-op, so the run would exit 0 having
+            // done nothing. Fail with the same guidance instead of pretending.
+            if self.oci_cache
+                && self.command.is_empty()
+                && !self.interactive
+                && self.smolfile.is_none()
+                && params.entrypoint.is_empty()
+                && params.cmd.is_empty()
+            {
+                return Err(Error::config(
+                    "machine run",
+                    "--oci-cache needs a command to run: pass one after `--`, use -it for a \
+                     shell, or supply a Smolfile with an entrypoint/cmd"
+                        .to_string(),
+                ));
+            }
+            // Auth gate: resolve + authorize the image on the HOST before baking
+            // or serving a cached bake. A private image the caller cannot pull is
+            // rejected here — the same registry-authorization gate the cloud path
+            // uses, so caching never bypasses pull authorization. `FromConfig`
+            // reads the local docker-config credentials (so `docker login`ed
+            // private images resolve); anonymous is the fallback for public ones.
+            //
+            // The resolved digest also becomes part of the cache key, so the entry
+            // tracks the image's CONTENT: when a mutable tag moves upstream the key
+            // changes and the new content is baked, instead of serving the first
+            // run's image forever.
+            let mut resolved_digest = None;
+            if self.oci_cache {
+                if let Some(image) = params.image.as_deref() {
+                    let auth = smolvm::registry::PullAuth::FromConfig;
+                    let rt = tokio::runtime::Runtime::new()
+                        .map_err(|e| Error::config("oci-cache", e.to_string()))?;
+                    resolved_digest =
+                        Some(rt.block_on(smolvm::image_store::authorized_digest(image, &auth))?);
+                }
+            }
+            let cached = ensure_init_layer(
+                &params,
+                self.smolfile.as_deref(),
+                self.rebuild_init_cache,
+                resolved_digest.as_deref(),
+            )?;
             // The real workload: CLI trailing args win, else the Smolfile's
             // entrypoint+cmd (the baked artifact's own command is a `/bin/true` no-op).
             let command = if !self.command.is_empty() {
@@ -1056,7 +1193,8 @@ impl RunCmd {
                 force_extract: false,
                 info: false,
                 debug: false,
-                cuda: false,
+                cuda: self.cuda || params.cuda,
+                auto_graph: self.auto_graph,
             }
             .run();
         }
@@ -1751,30 +1889,63 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    /// `--oci-cache` resolves the image digest at the auth gate and mixes it into
+    /// the key, so the cache tracks CONTENT. Without this a mutable tag like
+    /// `alpine:latest` hashes identically forever and the first run's image keeps
+    /// being served — upstream updates (security fixes included) never land.
+    #[test]
+    fn init_layer_key_pins_the_resolved_digest() {
+        let init: Vec<String> = vec![];
+        let env: Vec<String> = vec![];
+        let untagged = init_layer_key(Some("alpine:latest"), &init, &env, None);
+        let first = init_layer_key(Some("alpine:latest"), &init, &env, Some("sha256:aaa"));
+        let moved = init_layer_key(Some("alpine:latest"), &init, &env, Some("sha256:bbb"));
+
+        assert_ne!(
+            first, moved,
+            "the same tag at a NEW digest must be a new cache entry"
+        );
+        assert_eq!(
+            first,
+            init_layer_key(Some("alpine:latest"), &init, &env, Some("sha256:aaa")),
+            "the same tag at the same digest still hits"
+        );
+        assert_ne!(
+            untagged, first,
+            "supplying a digest changes the key (no collision with the un-pinned path)"
+        );
+    }
+
     #[test]
     fn init_layer_key_is_stable_and_input_sensitive() {
         let init = vec!["apt-get install -y jq".to_string()];
         let env = vec!["FOO=bar".to_string()];
-        let base = init_layer_key(Some("ubuntu:noble"), &init, &env);
+        let base = init_layer_key(Some("ubuntu:noble"), &init, &env, None);
         // Deterministic for identical inputs.
-        assert_eq!(base, init_layer_key(Some("ubuntu:noble"), &init, &env));
+        assert_eq!(
+            base,
+            init_layer_key(Some("ubuntu:noble"), &init, &env, None)
+        );
         assert_eq!(base.len(), 16);
         // Sensitive to each input: image, init, env.
-        assert_ne!(base, init_layer_key(Some("ubuntu:jammy"), &init, &env));
         assert_ne!(
             base,
-            init_layer_key(Some("ubuntu:noble"), &["other".to_string()], &env)
+            init_layer_key(Some("ubuntu:jammy"), &init, &env, None)
         );
         assert_ne!(
             base,
-            init_layer_key(Some("ubuntu:noble"), &init, &["FOO=baz".to_string()])
+            init_layer_key(Some("ubuntu:noble"), &["other".to_string()], &env, None)
+        );
+        assert_ne!(
+            base,
+            init_layer_key(Some("ubuntu:noble"), &init, &["FOO=baz".to_string()], None)
         );
         // Order of init steps matters (different layer).
         let init_rev = vec!["b".to_string(), "a".to_string()];
         let init_fwd = vec!["a".to_string(), "b".to_string()];
         assert_ne!(
-            init_layer_key(Some("x"), &init_fwd, &[]),
-            init_layer_key(Some("x"), &init_rev, &[])
+            init_layer_key(Some("x"), &init_fwd, &[], None),
+            init_layer_key(Some("x"), &init_rev, &[], None)
         );
     }
 
@@ -1858,6 +2029,149 @@ mod tests {
         assert!(cmd.detach);
     }
 
+    #[test]
+    fn start_cuda_pool_flags_parse_and_limit_requires_pool() {
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "start",
+            "--name",
+            "golden",
+            "--fork-pool-size",
+            "4",
+            "--cuda-vram-limit-mib",
+            "10240",
+        ]);
+        let MachineCmd::Start(cmd) = cli.command else {
+            panic!("expected machine start command");
+        };
+        assert_eq!(cmd.fork_pool_size.map(|v| v.get()), Some(4));
+        assert_eq!(cmd.cuda_vram_limit_mib.map(|v| v.get()), Some(10240));
+
+        assert!(TestMachineCli::try_parse_from([
+            "machine",
+            "start",
+            "--name",
+            "golden",
+            "--cuda-vram-limit-mib",
+            "10240",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn fork_accepts_single_and_batch_forms() {
+        let single =
+            TestMachineCli::parse_from(["machine", "fork", "--golden", "base", "--name", "worker"]);
+        let MachineCmd::Fork(single) = single.command else {
+            panic!("expected machine fork command");
+        };
+        assert_eq!(single.clone.as_deref(), Some("worker"));
+        assert_eq!(single.count.get(), 1);
+        assert!(!single.wait_ready);
+
+        let batch = TestMachineCli::parse_from([
+            "machine",
+            "fork",
+            "--golden",
+            "base",
+            "--count",
+            "8",
+            "--name-prefix",
+            "worker",
+            "--parallel",
+            "3",
+            "--ready-timeout",
+            "2m",
+        ]);
+        let MachineCmd::Fork(batch) = batch.command else {
+            panic!("expected machine fork command");
+        };
+        assert_eq!(batch.count.get(), 8);
+        assert_eq!(batch.name_prefix.as_deref(), Some("worker"));
+        assert_eq!(batch.parallel.get(), 3);
+        assert!(!batch.wait_ready);
+        assert_eq!(batch.ready_timeout, Duration::from_secs(120));
+        assert_eq!(
+            forkpoint_timeout(
+                batch.count.get(),
+                batch.wait_ready,
+                batch.hold,
+                batch.ready_timeout,
+            ),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(
+            forkpoint_timeout(1, false, false, Duration::from_secs(120)),
+            None
+        );
+        assert_eq!(
+            forkpoint_timeout(1, false, true, Duration::from_secs(120)),
+            Some(Duration::from_secs(120))
+        );
+
+        let release = TestMachineCli::parse_from([
+            "machine",
+            "fork-release",
+            "--name",
+            "worker-0",
+            "--env",
+            "LR=3e-4",
+        ]);
+        let MachineCmd::ForkRelease(release) = release.command else {
+            panic!("expected fork-release command");
+        };
+        assert_eq!(release.name, "worker-0");
+        assert_eq!(release.env, vec!["LR=3e-4"]);
+    }
+
+    #[test]
+    fn indexed_fork_env_renders_each_clone() {
+        let specs = vec![
+            "TRIAL={index}".to_string(),
+            "OUTPUT=/runs/{name}".to_string(),
+            "SMOLVM_FORK_INDEX=wrong".to_string(),
+        ];
+        assert_eq!(
+            render_indexed_fork_env(&specs, 3, "worker-3", true),
+            vec![
+                ("TRIAL".to_string(), "3".to_string()),
+                ("OUTPUT".to_string(), "/runs/worker-3".to_string()),
+                ("SMOLVM_FORK_INDEX".to_string(), "3".to_string()),
+                ("SMOLVM_FORK_NAME".to_string(), "worker-3".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn run_accepts_auto_graph_flag() {
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "run",
+            "--auto-graph",
+            "--image",
+            "alpine",
+            "--",
+            "true",
+        ]);
+
+        let MachineCmd::Run(cmd) = cli.command else {
+            panic!("expected machine run command");
+        };
+        assert!(cmd.auto_graph);
+        assert!(!cmd.cuda, "auto-graph implies CUDA during parameter merge");
+    }
+
+    #[test]
+    fn create_accepts_auto_graph_flag() {
+        let cli =
+            TestMachineCli::parse_from(["machine", "create", "--name", "golden", "--auto-graph"]);
+
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create command");
+        };
+        assert!(cmd.auto_graph);
+    }
+
     // Documents the clap parsing behaviour: positionals before "--" land in
     // `command`, not `image`.  is_likely_image_ref() catches the unambiguous
     // cases before a VM is booted.
@@ -1929,6 +2243,42 @@ mod tests {
         // Absolute and relative paths are always commands
         assert!(!is_likely_image_ref("/bin/sh"));
         assert!(!is_likely_image_ref("./script.sh"));
+    }
+
+    #[test]
+    fn prune_evicts_oldest_and_a_touch_saves_a_hot_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, bytes: usize| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, vec![0u8; bytes]).unwrap();
+            p
+        };
+        // Three 4 KiB entries; cap at 6 KiB forces evicting down to one.
+        let cold = write("cold.smolmachine", 4096);
+        let mid = write("mid.smolmachine", 4096);
+        let hot = write("hot.smolmachine", 4096);
+
+        // Establish an age order: cold < mid < hot, then simulate a cache HIT on
+        // `cold` by touching it so it becomes the most-recently-used.
+        let base = std::time::SystemTime::now() - std::time::Duration::from_secs(300);
+        for (p, age) in [(&cold, 300), (&mid, 200), (&hot, 100)] {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(base + std::time::Duration::from_secs(300 - age))
+                .unwrap();
+        }
+        touch_cache_entry(&cold); // hit → now newest
+
+        // Cap at 8 KiB keeps two of the three 4 KiB entries, evicting exactly one.
+        prune_init_cache(dir.path(), 8192, &hot);
+
+        // `hot` is kept (explicit keep), `cold` survives (just touched), and the
+        // now-oldest `mid` is the one evicted.
+        assert!(hot.exists(), "the just-baked entry is always kept");
+        assert!(cold.exists(), "a touched (recently-used) entry survives");
+        assert!(!mid.exists(), "the least-recently-used entry is evicted");
     }
 }
 
@@ -2356,6 +2706,11 @@ pub struct CreateCmd {
     #[arg(long)]
     pub cuda: bool,
 
+    /// Ask compatible CUDA frameworks to graph safe compiled regions.
+    /// Implies --cuda; arbitrary eager CUDA calls are not captured.
+    #[arg(long)]
+    pub auto_graph: bool,
+
     /// Expose the guest's Docker daemon socket to the host as a Unix socket
     /// (DOCKER_HOST=unix://…). Requires dockerd running in the VM.
     #[arg(long)]
@@ -2464,6 +2819,10 @@ impl CreateCmd {
             cli_allow_cidrs,
         )?;
         let mut params = params;
+        if self.auto_graph {
+            smolvm::util::enable_cuda_auto_graph_env_specs(&mut params.env);
+            params.cuda = true;
+        }
         params.dns_filter_hosts = match (params.dns_filter_hosts.take(), cli_dns_filter_hosts) {
             (Some(mut from_smolfile), Some(mut from_cli)) => {
                 from_smolfile.append(&mut from_cli);
@@ -2655,6 +3014,9 @@ impl CreateCmd {
             env: {
                 let mut env = manifest.env;
                 env.extend(self.env.iter().cloned());
+                if self.auto_graph {
+                    smolvm::util::enable_cuda_auto_graph_env_specs(&mut env);
+                }
                 env
             },
             workdir: manifest.workdir,
@@ -2670,7 +3032,7 @@ impl CreateCmd {
             health_retries: None,
             health_startup_grace_secs: None,
             ssh_agent: self.ssh_agent,
-            cuda: self.cuda,
+            cuda: self.cuda || self.auto_graph,
             docker_socket: self.docker_socket,
             dns_filter_hosts: None,
             published_sockets: parse_published_sockets(&self.expose_socket, &self.mount_socket)?,
@@ -2792,6 +3154,18 @@ pub struct StartCmd {
     #[arg(long)]
     pub forkable: bool,
 
+    /// Plan a CUDA fork pool with this many runnable clones. Smolvm reports a
+    /// safe per-session VRAM share before the golden initializes, so vLLM and
+    /// similar runtimes size private caches without workload changes. Implies
+    /// --forkable.
+    #[arg(long, value_name = "CLONES")]
+    pub fork_pool_size: Option<std::num::NonZeroU32>,
+
+    /// Override the automatic logical VRAM budget for each golden/clone CUDA
+    /// session. The workload still needs no changes. Requires --fork-pool-size.
+    #[arg(long, value_name = "MIB", requires = "fork_pool_size")]
+    pub cuda_vram_limit_mib: Option<std::num::NonZeroU64>,
+
     #[command(flatten, next_help_heading = "Network")]
     pub proxy_opts: crate::cli::proxy_opts::ProxyOpts,
 }
@@ -2804,8 +3178,11 @@ impl StartCmd {
         let no_proxy = self.proxy_opts.no_proxy();
         // Forkable start: memfd-back guest RAM and register a control socket at a
         // known path so `machine fork` can later freeze this machine as a CoW base.
-        let fork = if self.forkable {
-            vm_common::forkable_launch()
+        let fork = if self.forkable || self.fork_pool_size.is_some() {
+            let mut launch = vm_common::forkable_launch();
+            launch.pool_size = self.fork_pool_size.map(std::num::NonZeroU32::get);
+            launch.vram_limit_mib = self.cuda_vram_limit_mib.map(std::num::NonZeroU64::get);
+            launch
         } else {
             vm_common::ForkLaunch::default()
         };
@@ -2843,7 +3220,42 @@ pub struct ForkCmd {
 
     /// Name for the new clone machine.
     #[arg(short = 'n', long = "name", value_name = "NAME")]
-    pub clone: String,
+    pub clone: Option<String>,
+
+    /// Number of clones to create from one snapshot. Batch forks wait for the
+    /// standard `smolvm-fork-ready` boundary automatically.
+    #[arg(long, default_value = "1", value_name = "COUNT")]
+    pub count: std::num::NonZeroU32,
+
+    /// Name batch clones PREFIX-0 through PREFIX-(COUNT-1).
+    #[arg(long, value_name = "PREFIX")]
+    pub name_prefix: Option<String>,
+
+    /// Maximum number of clone boots in flight during a batch fork.
+    #[arg(long, default_value = "4", value_name = "COUNT")]
+    pub parallel: std::num::NonZeroU32,
+
+    /// Wait for `smolvm-fork-ready` in a single-clone fork. Batch forks always
+    /// wait; unless held, they release clones only after identity and fork env
+    /// are installed.
+    #[arg(long)]
+    pub wait_ready: bool,
+
+    /// Keep each clone parked at the inherited forkpoint as an already-booted
+    /// pool slot. Assign and release a slot later with `machine fork-release`.
+    /// A consumed slot is disposable; delete and replenish it from the golden
+    /// rather than reusing mutated training state.
+    #[arg(long)]
+    pub hold: bool,
+
+    /// Maximum time to wait for the golden workload's forkpoint.
+    #[arg(
+        long,
+        default_value = "10m",
+        value_parser = parse_duration,
+        value_name = "DURATION",
+    )]
+    pub ready_timeout: Duration,
 
     /// Make the clone itself forkable (memfd RAM + control socket), so it can
     /// in turn be forked.
@@ -2863,7 +3275,7 @@ pub struct ForkCmd {
     pub share_weights: bool,
 
     /// Per-fork parameter (repeatable, KEY=VALUE). Delivered to the clone as
-    /// `/run/smolvm/fork-env` (dotenv format) for the already-running workload
+    /// `/etc/smolvm/fork-env` (dotenv format) for the already-running workload
     /// to read, and merged into the clone's env for later `machine exec`
     /// sessions. This is how sweep/rollout clones learn which variant they
     /// are — no shared-mount claim files needed.
@@ -2896,20 +3308,148 @@ pub struct ForkCmd {
 impl ForkCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let ports: Vec<(u16, u16)> = self.port.iter().map(|p| (p.host, p.guest)).collect();
-        let fork_env = smolvm::util::parse_env_list(&self.env);
         // Parse per-fork secret refs (TrustedLocal — host env/absolute file);
         // they merge into the clone's secret_refs and resolve fresh per exec.
         let fork_secrets = parse_cli_secret_refs(&self.secret_env, &self.secret_file)?;
-        vm_common::fork_vm(
+        let count = self.count.get();
+        let wait_ready = forkpoint_timeout(count, self.wait_ready, self.hold, self.ready_timeout);
+        if count > 1024 {
+            return Err(smolvm::Error::config(
+                "fork",
+                "--count cannot exceed 1024 clones per batch",
+            ));
+        }
+        if self.hold && self.forkable {
+            return Err(smolvm::Error::config(
+                "fork",
+                "--hold cannot be combined with --forkable; pool slots are disposable leaves",
+            ));
+        }
+
+        if count == 1 {
+            let clone = match (self.clone, self.name_prefix) {
+                (Some(clone), None) => clone,
+                (None, Some(prefix)) => format!("{prefix}-0"),
+                (Some(_), Some(_)) => {
+                    return Err(smolvm::Error::config(
+                        "fork",
+                        "use either --name or --name-prefix, not both",
+                    ));
+                }
+                (None, None) => {
+                    return Err(smolvm::Error::config(
+                        "fork",
+                        "--name is required for one clone; use --name-prefix with --count for a batch",
+                    ));
+                }
+            };
+            let fork_env = render_indexed_fork_env(&self.env, 0, &clone, false);
+            return vm_common::fork_vm(
+                &self.golden,
+                &clone,
+                vm_common::ForkVmOptions {
+                    clone_forkable: self.forkable,
+                    pinned_ports: &ports,
+                    share_weights: self.share_weights,
+                    fork_env: &fork_env,
+                    fork_secrets: &fork_secrets,
+                    wait_ready,
+                    hold: self.hold,
+                },
+            );
+        }
+
+        if self.clone.is_some() {
+            return Err(smolvm::Error::config(
+                "fork",
+                "--name cannot be used with --count greater than 1; use --name-prefix",
+            ));
+        }
+        let prefix = self.name_prefix.ok_or_else(|| {
+            smolvm::Error::config(
+                "fork",
+                "--name-prefix is required with --count greater than 1",
+            )
+        })?;
+        if self.forkable {
+            return Err(smolvm::Error::config(
+                "fork",
+                "--forkable is not supported for batch clones",
+            ));
+        }
+        if !ports.is_empty() {
+            return Err(smolvm::Error::config(
+                "fork",
+                "pinned --port mappings are not supported for a batch; inherited ports are remapped automatically",
+            ));
+        }
+
+        let clones: Vec<_> = (0..count)
+            .map(|index| {
+                let name = format!("{prefix}-{index}");
+                let env = render_indexed_fork_env(&self.env, index, &name, true);
+                (name, env)
+            })
+            .collect();
+        vm_common::fork_vm_batch(
             &self.golden,
-            &self.clone,
-            self.forkable,
-            &ports,
+            &clones,
             self.share_weights,
-            &fork_env,
             &fork_secrets,
+            wait_ready,
+            self.parallel.get() as usize,
+            self.hold,
         )
     }
+}
+
+/// Assign job-specific parameters and release one held fork-pool slot.
+#[derive(Args, Debug)]
+pub struct ForkReleaseCmd {
+    /// Held clone to assign and release.
+    #[arg(short = 'n', long = "name", value_name = "NAME")]
+    pub name: String,
+
+    /// Assignment parameter (repeatable, KEY=VALUE). Values override matching
+    /// parameters installed when the slot was provisioned.
+    #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
+    pub env: Vec<String>,
+}
+
+impl ForkReleaseCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let env = smolvm::util::parse_env_list(&self.env);
+        vm_common::release_held_fork(&self.name, &env)
+    }
+}
+
+fn render_indexed_fork_env(
+    specs: &[String],
+    index: u32,
+    name: &str,
+    include_identity: bool,
+) -> Vec<(String, String)> {
+    let mut env = smolvm::util::parse_env_list(specs);
+    for (_, value) in &mut env {
+        *value = value
+            .replace("{index}", &index.to_string())
+            .replace("{name}", name);
+    }
+    if include_identity {
+        env.retain(|(key, _)| key != "SMOLVM_FORK_INDEX" && key != "SMOLVM_FORK_NAME");
+        env.push(("SMOLVM_FORK_INDEX".to_string(), index.to_string()));
+        env.push(("SMOLVM_FORK_NAME".to_string(), name.to_string()));
+    }
+    env
+}
+
+fn forkpoint_timeout(
+    count: u32,
+    explicitly_requested: bool,
+    hold: bool,
+    timeout: Duration,
+) -> Option<Duration> {
+    (count > 1 || explicitly_requested || hold).then_some(timeout)
 }
 
 // ============================================================================

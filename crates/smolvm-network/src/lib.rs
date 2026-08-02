@@ -69,13 +69,15 @@ pub mod icmp_relay;
 // needs /dev/net/tun + setns).
 #[cfg(target_os = "linux")]
 pub mod netns_tap;
+pub mod policy;
 pub mod queues;
 pub mod stack;
 pub mod tcp_listeners;
 pub mod tcp_relay;
 pub mod udp_relay;
 
-pub use egress::{EgressConfig, EgressPolicy, FloorMode, StaticTarget};
+pub use egress::{is_floored, AllowListPolicy, Cidr, FloorMode};
+pub use policy::{DnsVerdict, EgressPolicy, Policy};
 
 use socket2::Socket;
 use std::fmt;

@@ -437,10 +437,18 @@ mod tests {
         assert_eq!(&response[..2], &query[..2]); // echoed id
         let flags = read_u16(&response, DNS_FLAGS_OFFSET).unwrap();
         assert_eq!(flags & DNS_FLAG_RESPONSE, DNS_FLAG_RESPONSE);
-        // Our own parser must extract exactly the synthesized records.
+        // Our own parser must extract exactly the synthesized records — and only
+        // the ones the question asked for: `query_for` asks A, so the AAAA is
+        // left out rather than answered under the wrong type.
+        assert_eq!(answer_ip_records(&response), vec![(ips[0], 60)]);
+
+        // …and an AAAA question gets the other one, from the same record set.
+        let mut aaaa = query_for("api.internal");
+        let qtype = aaaa.len() - 4;
+        aaaa[qtype..qtype + 2].copy_from_slice(&DNS_TYPE_AAAA.to_be_bytes());
         assert_eq!(
-            answer_ip_records(&response),
-            vec![(ips[0], 60), (ips[1], 60)]
+            answer_ip_records(&build_ip_response(&aaaa, &ips, 60)),
+            vec![(ips[1], 60)]
         );
     }
 

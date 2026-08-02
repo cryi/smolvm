@@ -9,7 +9,105 @@
 //! `[machines]` and `[images]` sections. See [`crate::settings::SmolSettings`].
 
 use serde::{Deserialize, Serialize};
+use smolvm_registry::RegistryClient;
 use std::collections::HashMap;
+
+/// How a caller authorizes a registry pull.
+///
+/// [`PullAuth::FromConfig`] (the default) resolves credentials from the local
+/// registry config — `docker login` / `smolvm.toml` — which is what the CLI
+/// uses. The explicit variants are for programmatic callers: the smol SDK passes
+/// [`PullAuth::Basic`] or [`PullAuth::Bearer`] from its `registryAuth` option,
+/// and the cloud passes the control-plane per-tenant token as
+/// [`PullAuth::Identity`] or [`PullAuth::Bearer`]. Every surface authorizes
+/// through the one [`registry_client`] path below, so behavior is identical.
+#[derive(Clone, Debug, Default)]
+pub enum PullAuth {
+    /// Resolve credentials from `RegistryConfig` (the CLI default).
+    #[default]
+    FromConfig,
+    /// No credentials — anonymous/public pulls.
+    Anonymous,
+    /// Username + password, sent as Basic to the registry's auth service.
+    Basic {
+        /// Registry account username.
+        username: String,
+        /// Registry account password or personal access token.
+        password: String,
+    },
+    /// A pre-minted OCI bearer token, sent directly on every request.
+    Bearer(String),
+    /// An identity/refresh token exchanged at the auth service for a scoped token.
+    Identity(String),
+}
+
+/// Build a [`RegistryClient`] for `registry`, resolving its API endpoint (Docker
+/// Hub's `registry-1.docker.io`, configured mirrors, local plaintext) and
+/// applying `auth`: an explicit credential, or the ones from `config` when
+/// [`PullAuth::FromConfig`].
+///
+/// This is the single credential-resolution path shared by the pack tooling and
+/// the OCI image cache, so a pull authorizes the same way whoever drives it.
+pub fn registry_client(registry: &str, config: &RegistryConfig, auth: &PullAuth) -> RegistryClient {
+    // Resolve the config-key hostname to its Distribution API endpoint. The config
+    // key stays the user-facing name so credential lookup is consistent — only the
+    // HTTP endpoint changes:
+    //   * Docker Hub is "docker.io" to users but serves the API at
+    //     "registry-1.docker.io".
+    //   * The smol registry's apex "smolmachines.com" (what the guest's
+    //     `registry_pull_hosts` yields) serves the API at the "registry." subdomain;
+    //     the already-canonical "registry.smolmachines.com" maps to itself.
+    let effective = config.get_mirror(registry).unwrap_or(registry);
+    let api_host = match effective {
+        "docker.io" => "registry-1.docker.io",
+        h if h.ends_with("smolmachines.com") => SMOLMACHINES_REGISTRY,
+        h => h,
+    };
+    let base_url = if smolvm_registry::is_local_registry(api_host) {
+        format!("http://{}", api_host)
+    } else {
+        format!("https://{}", api_host)
+    };
+
+    // Credential lookup must follow the SAME normalization as the endpoint, or a
+    // caller-supplied alias silently resolves to no credentials. The guest's
+    // `registry_pull_hosts` yields the apex `smolmachines.com`, but credentials
+    // are stored under the canonical `registry.smolmachines.com` — looking up the
+    // raw name there degrades an authorized user to an anonymous client, and
+    // their private image 401s at the gate.
+    let cred_key = match registry {
+        h if h.ends_with("smolmachines.com") => SMOLMACHINES_REGISTRY,
+        h => h,
+    };
+
+    let client = RegistryClient::new(base_url);
+    match auth {
+        PullAuth::Anonymous => client,
+        PullAuth::Basic { username, password } => {
+            client.with_basic_credentials(username.clone(), password.clone())
+        }
+        PullAuth::Bearer(token) => client.with_token(token.clone()),
+        PullAuth::Identity(token) => client.with_identity_token(token.clone()),
+        PullAuth::FromConfig => {
+            let Some(entry) = config.registries.get(cred_key) else {
+                return client;
+            };
+            if let Some(identity_token) = &entry.identity_token {
+                client.with_identity_token(identity_token.clone())
+            } else if let Some(cred) = config.get_credentials(cred_key) {
+                // Legacy convention: username "token" means the password IS the
+                // bearer token; otherwise it's standard Docker/OCI Basic auth.
+                if cred.username == "token" {
+                    client.with_token(cred.password)
+                } else {
+                    client.with_basic_credentials(cred.username, cred.password)
+                }
+            } else {
+                client
+            }
+        }
+    }
+}
 
 /// Registry credentials and defaults for a set of OCI registries.
 ///
@@ -422,6 +520,23 @@ impl Reference {
             }
         }
 
+        // Reject any repository component that could break out of the `/v2/<repo>/`
+        // prefix when interpolated into a registry URL: a `.`/`..` traversal segment
+        // or anything outside the OCI repository charset (notably `%`, which can
+        // smuggle an encoded slash). Without this, `..` in a component turns
+        // `/v2/<repo>/manifests/...` into a request to an unrelated path on the host.
+        for component in namespace
+            .iter()
+            .flat_map(|ns| ns.split('/'))
+            .chain(std::iter::once(name.as_str()))
+        {
+            if !is_valid_repo_component(component) {
+                return Err(err(
+                    "invalid repository component (path traversal or disallowed characters)",
+                ));
+            }
+        }
+
         Ok(Reference {
             registry,
             namespace,
@@ -438,6 +553,18 @@ impl Reference {
             None => self.name.clone(),
         }
     }
+}
+
+/// A single `/`-delimited repository path component is safe to interpolate into a
+/// `/v2/<repo>/...` registry URL: non-empty, not a `.`/`..` traversal segment, and
+/// limited to the OCI repository charset `[A-Za-z0-9._-]` (so no `%`, `/`, or other
+/// URL metacharacters that could smuggle an encoded slash or escape the prefix).
+fn is_valid_repo_component(c: &str) -> bool {
+    !c.is_empty()
+        && c != "."
+        && c != ".."
+        && c.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
 }
 
 impl std::fmt::Display for Reference {
@@ -952,6 +1079,40 @@ mirror = "ghcr-mirror.example.com"
         );
     }
 
+    #[test]
+    fn test_reference_rejects_repository_path_traversal() {
+        // A `..` component would turn `/v2/<repo>/...` into a request to an
+        // unrelated path on the registry host — reject it (and `.`, and any
+        // component carrying URL metacharacters like `%`).
+        for bad in [
+            "127.0.0.1:8081/../api/v1/machines:latest",
+            "registry.example.com/org/../secret:latest",
+            "registry.example.com/org/%2e%2e:latest",
+            "registry.example.com/org/a%2fb:latest",
+            "registry.example.com/./machine:latest",
+        ] {
+            let err = Reference::parse(bad).unwrap_err();
+            assert!(
+                err.reason.contains("invalid repository component"),
+                "expected rejection for {bad}, got: {}",
+                err.reason
+            );
+        }
+    }
+
+    #[test]
+    fn test_reference_accepts_normal_repositories() {
+        // The guard must not reject legitimate OCI repository paths.
+        for ok in [
+            "python-dev:latest",
+            "binsquare/custom:v1",
+            "ghcr.io/org/team/machine:latest",
+            "registry.example.com/a.b_c-d/img:latest",
+        ] {
+            assert!(Reference::parse(ok).is_ok(), "should accept {ok}");
+        }
+    }
+
     // ── set_credentials / set_token / save ──────────────────────────────────
 
     #[test]
@@ -1034,6 +1195,40 @@ mirror = "ghcr-mirror.example.com"
         let creds = config.get_credentials("registry.smolmachines.com").unwrap();
         assert_eq!(creds.username, "token");
         assert_eq!(creds.password, "eyJhbGci.test");
+    }
+
+    /// The guest's `registry_pull_hosts` yields the smol registry's APEX
+    /// (`smolmachines.com`), while credentials are stored under the canonical
+    /// `registry.smolmachines.com`. Credential lookup must normalize the same way
+    /// the API endpoint does — otherwise an authorized user silently gets an
+    /// anonymous client and their private image 401s at the auth gate.
+    #[test]
+    fn registry_client_finds_credentials_via_the_smol_registry_apex() {
+        let mut config = RegistryConfig::default();
+        config.registries.insert(
+            "registry.smolmachines.com".to_string(),
+            RegistryEntry {
+                identity_token: Some("eyJ_upstream_jwt".to_string()),
+                ..Default::default()
+            },
+        );
+
+        // Canonical name resolves (the pre-existing behavior).
+        let canonical =
+            registry_client("registry.smolmachines.com", &config, &PullAuth::FromConfig);
+        assert_eq!(canonical.identity_token(), Some("eyJ_upstream_jwt"));
+
+        // The apex must resolve to the SAME credential, not silently to anonymous.
+        let apex = registry_client("smolmachines.com", &config, &PullAuth::FromConfig);
+        assert_eq!(
+            apex.identity_token(),
+            Some("eyJ_upstream_jwt"),
+            "apex must resolve to the canonical registry's credentials"
+        );
+
+        // An unrelated host still gets no credentials.
+        let other = registry_client("ghcr.io", &config, &PullAuth::FromConfig);
+        assert_eq!(other.identity_token(), None);
     }
 
     #[test]

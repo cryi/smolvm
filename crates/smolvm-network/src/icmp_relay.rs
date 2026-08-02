@@ -34,7 +34,7 @@
 //! drops host sockets idle for [`FLOW_IDLE_TIMEOUT`]. Loss under pressure (full
 //! channels / tables) is acceptable ICMP semantics — logged, never blocking.
 
-use crate::egress::EgressPolicy;
+use crate::policy::EgressPolicy;
 use crate::queues::WakePipe;
 use crate::virtio_net_log;
 use polling::{Event, Events};

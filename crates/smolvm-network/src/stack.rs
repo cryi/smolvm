@@ -51,10 +51,9 @@
 //! ```
 
 use crate::device::VirtioNetworkDevice;
-use crate::dns;
 use crate::dns_relay::{self, DnsQuery, DnsResponse, DnsTransport};
-use crate::egress::EgressPolicy;
 use crate::icmp_relay;
+use crate::policy::EgressPolicy;
 use crate::queues::NetworkFrameQueues;
 use crate::tcp_listeners::AcceptedTcpConnection;
 use crate::tcp_relay::{spawn_tcp_relay, TcpRelayTable};
@@ -210,10 +209,11 @@ fn run_network_stack(
         IpAddr::V6(config.gateway_ipv6),
         IpAddr::V6(link_local_from_mac(config.gateway_mac)),
     ];
-    // Static remaps need every TCP/53 SYN intercepted so the guest's own resolver doesn't win.
-    let intercept_dns_tcp = egress.has_static_dns();
+    // A policy that answers names itself needs every TCP/53 SYN intercepted, or
+    // the resolver the guest picked wins over the answer.
+    let intercept_dns_tcp = egress.intercepts_dns();
     let relay_wake = Arc::new(queues.relay_wake.clone());
-    let mut relays = TcpRelayTable::new(None, egress.clone());
+    let mut relays = TcpRelayTable::new(None, egress.clone(), gateway_addrs.to_vec());
     let mut udp_sockets = udp_relay::UdpSocketTable::new();
     let udp_channels = {
         let shutdown_queues = queues.clone();
@@ -748,48 +748,9 @@ impl DnsGateway {
     }
 }
 
-/// The decision for a single guest DNS query, made on the poll thread using the
-/// egress allow-host policy (no host I/O). Mirrors the previous inline filter.
-enum DnsDecision {
-    /// Answer the guest immediately with these raw DNS message bytes
-    /// (blocked -> NXDOMAIN, unparseable -> SERVFAIL).
-    Immediate(Vec<u8>),
-    /// Forward the query upstream via the offload thread; `learn` records the
-    /// answer's A/AAAA IPs into the egress allow-list when it returns.
-    Forward { learn: bool },
-}
-
-/// TTL on synthesized static answers (60s).
-const STATIC_DNS_TTL: u32 = 60;
-
-/// Returns a synthesized answer for a name the policy maps itself, or `None` to
-/// fall through to the normal allow-host path.
-fn static_dns_response(query: &[u8], egress: &EgressPolicy) -> Option<Vec<u8>> {
-    let ips = egress.static_answer(&dns::question_name(query)?)?;
-    Some(dns::build_ip_response(query, &ips, STATIC_DNS_TTL))
-}
-
-/// Classify a query: static names answered from the policy; otherwise standard
-/// allow-host filtering (forward if allowed, NXDOMAIN/SERVFAIL if not).
-fn classify_dns_query(query: &[u8], egress: &EgressPolicy) -> DnsDecision {
-    if let Some(response) = static_dns_response(query, egress) {
-        return DnsDecision::Immediate(response);
-    }
-    if !egress.dns_filter_active() {
-        return DnsDecision::Forward { learn: false };
-    }
-    match dns::question_name(query) {
-        Some(name) if egress.hostname_allowed(&name) => DnsDecision::Forward { learn: true },
-        Some(name) => {
-            virtio_net_log!(
-                "virtio-net: blocking DNS query by allow-host policy name={}",
-                name
-            );
-            DnsDecision::Immediate(dns::error_response(query, dns::DNS_RCODE_NXDOMAIN))
-        }
-        None => DnsDecision::Immediate(dns::error_response(query, dns::DNS_RCODE_SERVFAIL)),
-    }
-}
+/// The decision for a single guest DNS query, made on the poll thread by the
+/// egress policy (no host I/O).
+use crate::policy::DnsVerdict as DnsDecision;
 
 /// Drain guest UDP/53 queries out of the gateway socket. Blocked queries are
 /// answered inline (no host I/O); allowed queries are handed to the DNS offload
@@ -812,7 +773,7 @@ fn dispatch_dns_udp(
             Ok((q, m)) => (q.to_vec(), m.endpoint, m.local_address),
             Err(_) => break,
         };
-        match classify_dns_query(&query, egress) {
+        match egress.dns(&query) {
             DnsDecision::Immediate(response) => {
                 let response_meta = UdpMetadata {
                     endpoint,
@@ -875,7 +836,7 @@ fn deliver_dns_responses(
         if let Some(pending) = gateway.pending_udp.remove(&response.id) {
             if let Some(answer) = response.answer {
                 if pending.learn {
-                    egress.learn_ip_records(&answer);
+                    egress.learn(&answer);
                 }
                 let socket = sockets.get_mut::<UdpSocket>(dns_socket_handle);
                 let response_meta = UdpMetadata {
@@ -895,7 +856,7 @@ fn deliver_dns_responses(
                     conn.awaiting = None;
                     if let Some(answer) = response.answer {
                         if pending.learn {
-                            egress.learn_ip_records(&answer);
+                            egress.learn(&answer);
                         }
                         frame_dns_tcp_response(conn, &answer);
                     }
@@ -1039,7 +1000,7 @@ fn process_dns_tcp(
                     query.len(),
                     upstream_dns
                 );
-                match classify_dns_query(&query, egress) {
+                match egress.dns(&query) {
                     DnsDecision::Immediate(response) => {
                         frame_dns_tcp_response(conn, &response);
                         conn.done = true;
@@ -1169,8 +1130,10 @@ fn classify_guest_frame(
             };
 
             if tcp.syn() && !tcp.ack() {
-                // Intercept DNS/TCP to gateway (always) or to external resolvers
-                // when static remaps are configured.
+                // DNS/TCP to the gateway itself is intercepted by the local
+                // listening sockets (process_dns_tcp), not relayed — and every
+                // TCP/53 SYN is when the policy asks for it, so a resolver the
+                // guest picked cannot bypass what the policy answers or refuses.
                 if tcp.dst_port() == DNS_SOCKET_PORT
                     && (intercept_dns_tcp || gateway_addrs.contains(&dst_ip))
                 {
@@ -1260,10 +1223,10 @@ mod tests {
     }
 
     #[test]
-    fn dns_tcp_to_external_resolver_intercepted_when_remaps_exist() {
+    fn dns_tcp_to_external_resolver_intercepted_when_the_policy_asks() {
         let gw = IpAddr::V4(Ipv4Addr::new(100, 96, 0, 1));
-        // With static remaps configured the guest's own resolver must not win, so
-        // every TCP/53 SYN lands on the gateway DNS listeners instead.
+        // A policy that answers names itself must not lose to the guest's own
+        // resolver, so every TCP/53 SYN lands on the gateway DNS listeners.
         assert_eq!(
             classify_guest_frame(&tcp_syn_frame([1, 1, 1, 1], 53), &[gw], true),
             FrameAction::Passthrough
