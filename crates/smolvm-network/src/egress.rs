@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::dns;
-use crate::policy::{DnsVerdict, Policy};
+use crate::policy::{DnsDecision, Policy};
 use crate::virtio_net_log;
 
 /// Learned-IP TTL clamp, matching libkrun's DNS filter.
@@ -357,20 +357,20 @@ impl Policy for EgressPolicy {
         EgressPolicy::allows(self, ip)
     }
 
-    fn dns(&self, query: &[u8]) -> DnsVerdict {
+    fn dns(&self, query: &[u8]) -> DnsDecision {
         if !self.dns_filter_active() {
-            return DnsVerdict::Forward { learn: false };
+            return DnsDecision::Forward { learn: false };
         }
         match dns::question_name(query) {
-            Some(name) if self.hostname_allowed(&name) => DnsVerdict::Forward { learn: true },
+            Some(name) if self.hostname_allowed(&name) => DnsDecision::Forward { learn: true },
             Some(name) => {
                 virtio_net_log!(
                     "virtio-net: blocking DNS query by allow-host policy name={}",
                     name
                 );
-                DnsVerdict::Immediate(dns::error_response(query, dns::DNS_RCODE_NXDOMAIN))
+                DnsDecision::Immediate(dns::error_response(query, dns::DNS_RCODE_NXDOMAIN))
             }
-            None => DnsVerdict::Immediate(dns::error_response(query, dns::DNS_RCODE_SERVFAIL)),
+            None => DnsDecision::Immediate(dns::error_response(query, dns::DNS_RCODE_SERVFAIL)),
         }
     }
 
@@ -637,7 +637,7 @@ mod tests {
             assert!(
                 matches!(
                     p.dns(&query_for(allowed)),
-                    DnsVerdict::Forward { learn: true }
+                    DnsDecision::Forward { learn: true }
                 ),
                 "{allowed} should be forwarded"
             );
@@ -646,11 +646,11 @@ mod tests {
         // name nobody listed, SERVFAIL for a query that will not parse.
         for refused in ["evil.test", "example.com.evil.test", "notexample.com"] {
             assert!(
-                matches!(p.dns(&query_for(refused)), DnsVerdict::Immediate(_)),
+                matches!(p.dns(&query_for(refused)), DnsDecision::Immediate(_)),
                 "{refused} must not reach the resolver"
             );
         }
-        assert!(matches!(p.dns(&[0, 1, 2]), DnsVerdict::Immediate(_)));
+        assert!(matches!(p.dns(&[0, 1, 2]), DnsDecision::Immediate(_)));
 
         // No allow-host list: nothing is filtered, and nothing is learned either
         // — otherwise resolving any name would defeat `allowed_cidrs`.
@@ -658,7 +658,7 @@ mod tests {
         let o: &dyn Policy = &open;
         assert!(matches!(
             o.dns(&query_for("anything.test")),
-            DnsVerdict::Forward { learn: false }
+            DnsDecision::Forward { learn: false }
         ));
     }
 

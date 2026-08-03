@@ -53,7 +53,7 @@
 use crate::device::VirtioNetworkDevice;
 use crate::dns_relay::{self, DnsQuery, DnsResponse, DnsTransport};
 use crate::icmp_relay;
-use crate::policy::Egress;
+use crate::policy::{Policy, PolicyHandle};
 use crate::queues::NetworkFrameQueues;
 use crate::tcp_listeners::AcceptedTcpConnection;
 use crate::tcp_relay::{spawn_tcp_relay, TcpRelayTable};
@@ -155,7 +155,7 @@ pub fn start_network_stack(
     queues: Arc<NetworkFrameQueues>,
     config: VirtioPollConfig,
     tcp_receiver: Option<Receiver<AcceptedTcpConnection>>,
-    egress: Egress,
+    egress: PolicyHandle,
 ) -> std::io::Result<JoinHandle<()>> {
     virtio_net_log!(
         "virtio-net: spawning poll thread guest_ip={} gateway_ip={} mtu={}",
@@ -172,7 +172,7 @@ fn run_network_stack(
     queues: Arc<NetworkFrameQueues>,
     config: VirtioPollConfig,
     mut tcp_receiver: Option<Receiver<AcceptedTcpConnection>>,
-    egress: Egress,
+    egress: PolicyHandle,
 ) {
     // Poll loop overview:
     //
@@ -296,7 +296,7 @@ fn run_network_stack(
                 FrameAction::UdpFlow { destination } => {
                     // Same egress policy as TCP; a denied destination's datagram
                     // is silently dropped (a guest sees a normal UDP black hole).
-                    if udp_relay::should_relay_udp(destination, &egress)
+                    if udp_relay::should_relay_udp(destination, egress.as_ref())
                         && udp_sockets.ensure_socket(destination, &mut sockets)
                     {
                         if matches!(
@@ -337,7 +337,7 @@ fn run_network_stack(
         woke_dns |= dispatch_dns_udp(
             dns_socket_handle,
             &mut sockets,
-            &egress,
+            egress.as_ref(),
             config.upstream_dns,
             &mut dns_gateway,
             &dns_channels.to_relay,
@@ -346,7 +346,7 @@ fn run_network_stack(
             &dns_tcp_handles,
             &mut dns_tcp_conns,
             &mut sockets,
-            &egress,
+            egress.as_ref(),
             config.upstream_dns,
             &mut dns_gateway,
             &dns_channels.to_relay,
@@ -359,7 +359,7 @@ fn run_network_stack(
             &dns_tcp_handles,
             &mut dns_tcp_conns,
             &mut sockets,
-            &egress,
+            egress.as_ref(),
             &mut dns_gateway,
             &dns_channels.from_relay,
         );
@@ -380,7 +380,7 @@ fn run_network_stack(
             &mut sockets,
             icmp4_handle,
             false,
-            &egress,
+            egress.as_ref(),
             &gateway_addrs,
             &icmp_channels.to_relay,
         );
@@ -388,7 +388,7 @@ fn run_network_stack(
             &mut sockets,
             icmp6_handle,
             true,
-            &egress,
+            egress.as_ref(),
             &gateway_addrs,
             &icmp_channels.to_relay,
         );
@@ -563,7 +563,7 @@ fn drain_icmp_echo(
     sockets: &mut SocketSet<'_>,
     handle: SocketHandle,
     is_ipv6: bool,
-    egress: &Egress,
+    egress: &dyn Policy,
     gateway_addrs: &[IpAddr],
     to_relay: &SyncSender<icmp_relay::IcmpEcho>,
 ) -> bool {
@@ -750,7 +750,7 @@ impl DnsGateway {
 
 /// The decision for a single guest DNS query, made on the poll thread by the
 /// egress policy (no host I/O).
-use crate::policy::DnsVerdict as DnsDecision;
+use crate::policy::DnsDecision;
 
 /// Drain guest UDP/53 queries out of the gateway socket. Blocked queries are
 /// answered inline (no host I/O); allowed queries are handed to the DNS offload
@@ -759,7 +759,7 @@ use crate::policy::DnsVerdict as DnsDecision;
 fn dispatch_dns_udp(
     dns_socket_handle: SocketHandle,
     sockets: &mut SocketSet<'_>,
-    egress: &Egress,
+    egress: &dyn Policy,
     upstream_dns: Ipv4Addr,
     gateway: &mut DnsGateway,
     to_relay: &SyncSender<DnsQuery>,
@@ -828,7 +828,7 @@ fn deliver_dns_responses(
     dns_tcp_handles: &[SocketHandle],
     dns_tcp_conns: &mut [DnsTcpConn],
     sockets: &mut SocketSet<'_>,
-    egress: &Egress,
+    egress: &dyn Policy,
     gateway: &mut DnsGateway,
     from_relay: &Receiver<DnsResponse>,
 ) {
@@ -934,7 +934,7 @@ fn process_dns_tcp(
     handles: &[SocketHandle],
     conns: &mut [DnsTcpConn],
     sockets: &mut SocketSet<'_>,
-    egress: &Egress,
+    egress: &dyn Policy,
     upstream_dns: Ipv4Addr,
     gateway: &mut DnsGateway,
     to_relay: &SyncSender<DnsQuery>,

@@ -26,7 +26,7 @@
 //! - the relay thread owns the host-facing TCP socket
 //! - channels bridge payloads between them
 
-use crate::policy::Egress;
+use crate::policy::PolicyHandle;
 use crate::queues::WakePipe;
 use crate::virtio_net_log;
 use smoltcp::iface::{Interface, SocketHandle, SocketSet};
@@ -63,7 +63,7 @@ pub struct TcpRelayTable {
     max_connections: usize,
     /// Outbound allow-list applied before opening a host connection for a
     /// guest-initiated flow. Inbound published-port connections bypass it.
-    egress: Egress,
+    egress: PolicyHandle,
     /// The guest-visible gateway addresses (IPv4/IPv6/link-local). A guest flow
     /// destined to one of these is dialing "the host" via its default gateway,
     /// so the host-side relay connects to loopback instead of the gateway's own
@@ -189,7 +189,11 @@ impl RelayExitState {
 
 impl TcpRelayTable {
     /// Create a new relay table.
-    pub fn new(max_connections: Option<usize>, egress: Egress, gateway_ips: Vec<IpAddr>) -> Self {
+    pub fn new(
+        max_connections: Option<usize>,
+        egress: PolicyHandle,
+        gateway_ips: Vec<IpAddr>,
+    ) -> Self {
         Self {
             connections: HashMap::new(),
             connection_keys: HashSet::new(),

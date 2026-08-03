@@ -77,7 +77,7 @@ pub mod tcp_relay;
 pub mod udp_relay;
 
 pub use egress::{is_floored, Cidr, EgressPolicy, FloorMode};
-pub use policy::{DnsVerdict, Egress, Policy};
+pub use policy::{DnsDecision, Policy, PolicyHandle};
 
 use socket2::Socket;
 use std::fmt;
@@ -307,7 +307,7 @@ pub fn start_virtio_network(
         },
         tcp_listeners.as_ref().map(|_| tcp_receiver),
         // Shared from here on: the poll loop clones it into the relay threads.
-        std::sync::Arc::new(egress) as Egress,
+        std::sync::Arc::new(egress) as PolicyHandle,
     )?;
 
     Ok(VirtioNetworkRuntime {

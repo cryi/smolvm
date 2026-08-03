@@ -30,7 +30,7 @@
 //! pressure (full channels / tables) is acceptable UDP semantics — logged,
 //! never blocking.
 
-use crate::policy::Egress;
+use crate::policy::{Policy, PolicyHandle};
 use crate::queues::WakePipe;
 use crate::virtio_net_log;
 use polling::{Event, Events};
@@ -91,7 +91,7 @@ pub struct UdpRelayChannels {
 pub fn start_udp_relay(
     reply_wake: Arc<WakePipe>,
     shutdown: Arc<dyn Fn() -> bool + Send + Sync>,
-    egress: Egress,
+    egress: PolicyHandle,
 ) -> UdpRelayChannels {
     let (to_relay_tx, to_relay_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
     let (from_relay_tx, from_relay_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
@@ -132,7 +132,7 @@ fn run_udp_relay(
     wake: WakePipe,
     reply_wake: Arc<WakePipe>,
     shutdown: Arc<dyn Fn() -> bool + Send + Sync>,
-    egress: Egress,
+    egress: PolicyHandle,
 ) {
     let mut flows: HashMap<(SocketAddr, SocketAddr), UdpFlow> = HashMap::new();
     let mut recv_buf = vec![0u8; MAX_DATAGRAM_BYTES];
@@ -439,7 +439,7 @@ impl Default for UdpSocketTable {
 /// DNS (:53) is excluded — it has its own intercept-and-filter path. Egress
 /// policy applies exactly as for TCP, and judges the address the guest used —
 /// a `Policy::rewrite` of it happens afterwards, in the relay thread.
-pub fn should_relay_udp(destination: SocketAddr, egress: &Egress) -> bool {
+pub fn should_relay_udp(destination: SocketAddr, egress: &dyn Policy) -> bool {
     destination.port() != 53 && egress.allows(destination.ip(), Some(destination.port()))
 }
 
@@ -452,7 +452,6 @@ fn endpoint_to_socket_addr(endpoint: smoltcp::wire::IpEndpoint) -> SocketAddr {
 mod tests {
     use super::*;
     use crate::egress::EgressPolicy;
-    use crate::policy::Policy;
     use std::net::IpAddr;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -556,11 +555,14 @@ mod tests {
         // addressed from the sentinel the guest used, not from the loopback.
         let server = HostUdpSocket::bind("127.0.0.1:0").unwrap();
         let host_port = server.local_addr().unwrap().port();
-        let egress: Egress = Arc::new(SentinelPolicy(host_port));
+        let egress: PolicyHandle = Arc::new(SentinelPolicy(host_port));
         let sentinel = SocketAddr::new(SENTINEL, host_port);
-        assert!(should_relay_udp(sentinel, &egress));
+        assert!(should_relay_udp(sentinel, egress.as_ref()));
         // Only that port: the rewrite never widens what `allows` granted.
-        assert!(!should_relay_udp(SocketAddr::new(SENTINEL, 22), &egress));
+        assert!(!should_relay_udp(
+            SocketAddr::new(SENTINEL, 22),
+            egress.as_ref()
+        ));
 
         let reply_wake = Arc::new(WakePipe::new());
         let stop = Arc::new(AtomicBool::new(false));
@@ -604,22 +606,28 @@ mod tests {
 
     #[test]
     fn should_relay_respects_dns_carveout_and_policy() {
-        let open: Egress = Arc::new(EgressPolicy::unrestricted());
-        assert!(should_relay_udp("1.2.3.4:123".parse().unwrap(), &open));
-        assert!(!should_relay_udp("1.2.3.4:53".parse().unwrap(), &open));
+        let open: PolicyHandle = Arc::new(EgressPolicy::unrestricted());
+        assert!(should_relay_udp(
+            "1.2.3.4:123".parse().unwrap(),
+            open.as_ref()
+        ));
+        assert!(!should_relay_udp(
+            "1.2.3.4:53".parse().unwrap(),
+            open.as_ref()
+        ));
 
         // Public CIDR — a private allow-list entry would be overridden by the
         // egress hard-floor (see egress.rs tests).
-        let restricted: Egress = Arc::new(EgressPolicy::from_allowed_cidrs(Some(&[
-            "8.8.8.0/24".into()
+        let restricted: PolicyHandle = Arc::new(EgressPolicy::from_allowed_cidrs(Some(&[
+            "8.8.8.0/24".into(),
         ])));
         assert!(should_relay_udp(
             "8.8.8.3:123".parse().unwrap(),
-            &restricted
+            restricted.as_ref()
         ));
         assert!(!should_relay_udp(
             "1.2.3.4:123".parse().unwrap(),
-            &restricted
+            restricted.as_ref()
         ));
     }
 }

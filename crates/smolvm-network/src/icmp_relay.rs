@@ -34,7 +34,7 @@
 //! drops host sockets idle for [`FLOW_IDLE_TIMEOUT`]. Loss under pressure (full
 //! channels / tables) is acceptable ICMP semantics — logged, never blocking.
 
-use crate::policy::Egress;
+use crate::policy::Policy;
 use crate::queues::WakePipe;
 use crate::virtio_net_log;
 use polling::{Event, Events};
@@ -349,7 +349,7 @@ fn parse_echo_reply(destination: IpAddr, bytes: &[u8]) -> Option<(u16, Vec<u8>)>
 }
 
 /// Whether the gateway should relay a guest echo (portless, so any-port policy).
-pub fn should_relay_icmp(destination: IpAddr, egress: &Egress) -> bool {
+pub fn should_relay_icmp(destination: IpAddr, egress: &dyn Policy) -> bool {
     // ICMP echo carries no port, so only any-port allow rules cover it.
     egress.allows(destination, None)
 }
@@ -456,6 +456,7 @@ pub fn build_echo_reply_v6(reply: &IcmpEcho) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::PolicyHandle;
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -614,9 +615,9 @@ mod tests {
         }
 
         let ip: IpAddr = "1.1.1.1".parse().unwrap();
-        let scoped: Egress = std::sync::Arc::new(OnlyHttps);
-        let open: Egress = std::sync::Arc::new(AnyPort);
-        assert!(!should_relay_icmp(ip, &scoped));
-        assert!(should_relay_icmp(ip, &open));
+        let scoped: PolicyHandle = Arc::new(OnlyHttps);
+        let open: PolicyHandle = Arc::new(AnyPort);
+        assert!(!should_relay_icmp(ip, scoped.as_ref()));
+        assert!(should_relay_icmp(ip, open.as_ref()));
     }
 }

@@ -29,14 +29,15 @@
 //!
 //! [`crate::egress::EgressPolicy`] implements the trait with the
 //! `allowed_cidrs` + `--allow-host` semantics libkrun's TSI path uses, and is
-//! what the launchers build — the default, not the only shape. A policy reaches
-//! the relay threads as [`Egress`], which is cloned into each of them.
+//! what the launchers build — the default, not the only shape. The gateway owns
+//! a policy as a [`PolicyHandle`], cloning that into each relay thread; the
+//! parts that only ask it questions take a plain `&dyn Policy`.
 
 use std::net::IpAddr;
 use std::sync::Arc;
 
 /// What the gateway should do with one guest DNS query.
-pub enum DnsVerdict {
+pub enum DnsDecision {
     /// Answer the guest with these raw DNS bytes, no upstream query — a
     /// refusal is an answer too (NXDOMAIN, SERVFAIL).
     Immediate(Vec<u8>),
@@ -67,8 +68,8 @@ pub trait Policy: Send + Sync {
     }
 
     /// What to do with a guest DNS query; the default forwards it.
-    fn dns(&self, _query: &[u8]) -> DnsVerdict {
-        DnsVerdict::Forward { learn: false }
+    fn dns(&self, _query: &[u8]) -> DnsDecision {
+        DnsDecision::Forward { learn: false }
     }
 
     /// An upstream answer to a query [`Self::dns`] asked to learn from; the
@@ -85,9 +86,13 @@ pub trait Policy: Send + Sync {
     }
 }
 
-/// A shared handle to the policy in force, cheap to clone into the gateway's
-/// relay threads.
-pub type Egress = Arc<dyn Policy>;
+/// A policy the gateway owns and clones into its relay threads.
+///
+/// Refcounted, not a token: unlike `SocketHandle` elsewhere in this crate, this
+/// handle *is* the policy rather than an index to one, and cloning it shares the
+/// same object. That is the point — every thread that can open a host socket
+/// consults one policy, not a copy that could drift from it.
+pub type PolicyHandle = Arc<dyn Policy>;
 
 #[cfg(test)]
 mod tests {
@@ -110,7 +115,7 @@ mod tests {
     fn the_defaults_add_nothing_a_policy_did_not_ask_for() {
         let p: &dyn Policy = &AllowAll;
         assert_eq!(p.rewrite("1.1.1.1".parse().unwrap()), None);
-        assert!(matches!(p.dns(&[]), DnsVerdict::Forward { learn: false }));
+        assert!(matches!(p.dns(&[]), DnsDecision::Forward { learn: false }));
         assert!(!p.intercepts_dns());
         p.learn(&[]); // must not panic on an answer it never asked for
     }
@@ -134,8 +139,8 @@ mod tests {
                 (ip == STANDIN).then_some(REAL)
             }
 
-            fn dns(&self, _query: &[u8]) -> DnsVerdict {
-                DnsVerdict::Immediate(vec![0xde, 0xad])
+            fn dns(&self, _query: &[u8]) -> DnsDecision {
+                DnsDecision::Immediate(vec![0xde, 0xad])
             }
 
             fn intercepts_dns(&self) -> bool {
@@ -143,7 +148,7 @@ mod tests {
             }
         }
 
-        let egress: Egress = Arc::new(Custom);
+        let egress: PolicyHandle = Arc::new(Custom);
         let other: IpAddr = "1.1.1.1".parse().unwrap();
 
         // Per-port grants — what the built-in allow-list has no way to say.
@@ -159,7 +164,7 @@ mod tests {
 
         // The policy answers DNS itself, so the gateway must stop the guest's
         // own resolver from going around it.
-        assert!(matches!(egress.dns(&[]), DnsVerdict::Immediate(b) if b == [0xde, 0xad]));
+        assert!(matches!(egress.dns(&[]), DnsDecision::Immediate(b) if b == [0xde, 0xad]));
         assert!(egress.intercepts_dns());
 
         // Cloning the handle shares the policy rather than copying it.
