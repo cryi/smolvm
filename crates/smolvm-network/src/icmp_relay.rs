@@ -34,7 +34,7 @@
 //! drops host sockets idle for [`FLOW_IDLE_TIMEOUT`]. Loss under pressure (full
 //! channels / tables) is acceptable ICMP semantics — logged, never blocking.
 
-use crate::policy::EgressPolicy;
+use crate::policy::Egress;
 use crate::queues::WakePipe;
 use crate::virtio_net_log;
 use polling::{Event, Events};
@@ -349,7 +349,7 @@ fn parse_echo_reply(destination: IpAddr, bytes: &[u8]) -> Option<(u16, Vec<u8>)>
 }
 
 /// Whether the gateway should relay a guest echo (portless, so any-port policy).
-pub fn should_relay_icmp(destination: IpAddr, egress: &EgressPolicy) -> bool {
+pub fn should_relay_icmp(destination: IpAddr, egress: &Egress) -> bool {
     // ICMP echo carries no port, so only any-port allow rules cover it.
     egress.allows(destination, None)
 }

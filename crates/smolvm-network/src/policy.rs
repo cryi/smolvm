@@ -10,18 +10,15 @@
 //! - [`Policy::dns`] — forward, answer, or refuse a guest DNS query
 //! - [`Policy::learn`] — here is an answer you asked to see
 //!
-//! [`AllowListPolicy`](crate::egress::AllowListPolicy) implements it with the
+//! [`EgressPolicy`](crate::egress::EgressPolicy) implements it with the
 //! `allowed_cidrs` + `--allow-host` semantics libkrun's TSI path uses, and is
-//! what every [`EgressPolicy`] constructor here builds. An embedder wanting
-//! per-port grants, names the gateway answers itself, or a stand-in address for
-//! a host-local service writes its own implementation and passes it to
-//! [`EgressPolicy::custom`] rather than growing this crate.
+//! what the launchers build. An embedder wanting per-port grants, names
+//! the gateway answers itself, or a stand-in address for a host-local service
+//! writes its own implementation and hands the gateway an `Arc` of it rather
+//! than growing this crate.
 
 use std::net::IpAddr;
-use std::ops::Deref;
 use std::sync::Arc;
-
-use crate::egress::AllowListPolicy;
 
 /// What the gateway should do with one guest DNS query.
 pub enum DnsVerdict {
@@ -80,39 +77,5 @@ pub trait Policy: Send + Sync {
 }
 
 /// A shared handle to the policy in force, cheap to clone into the gateway's
-/// relay threads.
-#[derive(Clone)]
-pub struct EgressPolicy(Arc<dyn Policy>);
-
-impl EgressPolicy {
-    /// Plug in any policy.
-    pub fn custom(policy: Arc<dyn Policy>) -> Self {
-        Self(policy)
-    }
-
-    /// The built-in allow-list: no lists at all, i.e. allow everything except
-    /// the platform hard-floor.
-    pub fn unrestricted() -> Self {
-        Self::new(None, None)
-    }
-
-    /// The built-in allow-list over `allowed_cidrs` + `--allow-host` names.
-    /// Both `None` is [`Self::unrestricted`]; either one `Some` puts the list in
-    /// force.
-    pub fn new(allowed_cidrs: Option<&[String]>, allowed_hosts: Option<&[String]>) -> Self {
-        Self(Arc::new(AllowListPolicy::new(allowed_cidrs, allowed_hosts)))
-    }
-
-    /// The built-in allow-list with addresses only and no name filtering.
-    pub fn from_allowed_cidrs(allowed_cidrs: Option<&[String]>) -> Self {
-        Self::new(allowed_cidrs, None)
-    }
-}
-
-impl Deref for EgressPolicy {
-    type Target = dyn Policy;
-
-    fn deref(&self) -> &Self::Target {
-        self.0.as_ref()
-    }
-}
+/// relay threads. Just an alias — the policy is whatever implements the trait.
+pub type Egress = Arc<dyn Policy>;

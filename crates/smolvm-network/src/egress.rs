@@ -4,7 +4,7 @@
 //! layer; the virtio-net gateway terminates every guest flow itself, so it applies
 //! the same allow-list at the point it opens a host connection
 //! (`TcpRelayTable::create_tcp_socket`). This mirrors libkrun's `vsock/dns_filter.rs`
-//! `AllowListPolicy` so both backends behave identically:
+//! `EgressPolicy` so both backends behave identically:
 //!
 //! - static `allowed_cidrs` (IPv4 or IPv6) are always permitted;
 //! - `--allow-host` names are matched by the gateway's DNS interception, and the
@@ -212,13 +212,13 @@ pub fn is_floored(ip: IpAddr, mode: FloorMode) -> bool {
 /// connection. `unrestricted` allows everything EXCEPT the platform hard-floor
 /// (`is_floored`), whose scope is set once by `FloorMode`.
 #[derive(Clone)]
-pub struct AllowListPolicy {
+pub struct EgressPolicy {
     inner: Option<Arc<AllowList>>,
     /// Hard-floor scope, resolved once from the deployment context at creation.
     floor: FloorMode,
 }
 
-impl AllowListPolicy {
+impl EgressPolicy {
     /// No allow-list — every destination is allowed EXCEPT the platform hard-floor.
     pub fn unrestricted() -> Self {
         Self {
@@ -352,9 +352,9 @@ impl AllowListPolicy {
 /// The allow-list as the gateway's pluggable [`Policy`]. Ports play no part in
 /// it — a consumer wanting per-port grants writes its own implementation — so
 /// `port` is ignored and every DNS answer for an allowed name is learned whole.
-impl Policy for AllowListPolicy {
+impl Policy for EgressPolicy {
     fn allows(&self, ip: IpAddr, _port: Option<u16>) -> bool {
-        AllowListPolicy::allows(self, ip)
+        EgressPolicy::allows(self, ip)
     }
 
     fn dns(&self, query: &[u8]) -> DnsVerdict {
@@ -404,7 +404,7 @@ mod tests {
 
     #[test]
     fn unrestricted_allows_everything() {
-        let policy = AllowListPolicy::unrestricted();
+        let policy = EgressPolicy::unrestricted();
         assert!(!policy.is_restricted());
         assert!(policy.allows_v4(Ipv4Addr::new(8, 8, 8, 8)));
         assert!(policy.allows_v6("2001:4860:4860::8888".parse().unwrap()));
@@ -414,7 +414,7 @@ mod tests {
 
     #[test]
     fn empty_allowlist_denies_all() {
-        let policy = AllowListPolicy::from_allowed_cidrs(Some(&[]));
+        let policy = EgressPolicy::from_allowed_cidrs(Some(&[]));
         assert!(policy.is_restricted());
         assert!(!policy.allows_v4(Ipv4Addr::new(1, 1, 1, 1)));
         assert!(!policy.allows_v6("2606:4700::1111".parse().unwrap()));
@@ -423,7 +423,7 @@ mod tests {
     #[test]
     fn cidr_membership_v4() {
         // Public CIDRs only — private ranges are denied by the hard-floor below.
-        let policy = AllowListPolicy::new(Some(&["8.8.8.0/24".into(), "1.1.1.1".into()]), None);
+        let policy = EgressPolicy::new(Some(&["8.8.8.0/24".into(), "1.1.1.1".into()]), None);
         assert!(policy.allows_v4(Ipv4Addr::new(8, 8, 8, 7)));
         assert!(policy.allows_v4(Ipv4Addr::new(1, 1, 1, 1)));
         assert!(!policy.allows_v4(Ipv4Addr::new(1, 1, 1, 2)));
@@ -435,7 +435,7 @@ mod tests {
         // Local default (no fleet mode): only the cloud-metadata link-local range
         // is denied; the host's LAN, loopback, and CGNAT stay reachable — so a
         // local VM behaves predictably.
-        let p = AllowListPolicy::unrestricted();
+        let p = EgressPolicy::unrestricted();
         assert!(!p.allows_v4(Ipv4Addr::new(169, 254, 169, 254))); // metadata: denied
         assert!(p.allows_v4(Ipv4Addr::new(10, 0, 0, 4))); // LAN: reachable
         assert!(p.allows_v4(Ipv4Addr::new(127, 0, 0, 1))); // loopback: reachable
@@ -448,22 +448,22 @@ mod tests {
     #[test]
     fn metadata_floor_overrides_allowlist_and_learned_ips() {
         // The metadata range can't be re-opened by allow-listing it...
-        let p = AllowListPolicy::new(Some(&["169.254.0.0/16".into()]), None);
+        let p = EgressPolicy::new(Some(&["169.254.0.0/16".into()]), None);
         assert!(!p.allows_v4(Ipv4Addr::new(169, 254, 169, 254)));
         // ...nor via DNS-rebinding: a learned metadata IP stays denied.
-        let p2 = AllowListPolicy::new(None, Some(&["evil.test".into()]));
+        let p2 = EgressPolicy::new(None, Some(&["evil.test".into()]));
         let meta = IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254));
         p2.learn_ip_records(&[(meta, 300)]);
         assert!(!p2.allows(meta));
         // But a LAN IP in the allow-list IS reachable locally.
-        let p3 = AllowListPolicy::new(Some(&["10.0.0.0/8".into()]), None);
+        let p3 = EgressPolicy::new(Some(&["10.0.0.0/8".into()]), None);
         assert!(p3.allows_v4(Ipv4Addr::new(10, 0, 0, 4)));
     }
 
     #[test]
     fn metadata_floor_blocks_mapped_and_v6_link_local() {
-        let p = AllowListPolicy::unrestricted(); // MetadataOnly default
-                                                 // mapped metadata + v6 link-local are denied...
+        let p = EgressPolicy::unrestricted(); // MetadataOnly default
+                                              // mapped metadata + v6 link-local are denied...
         assert!(!p.allows_v6("::ffff:169.254.169.254".parse().unwrap()));
         assert!(!p.allows_v6("fe80::1".parse().unwrap()));
         // ...but v6 ULA (the LAN equivalent) and global unicast are reachable.
@@ -474,7 +474,7 @@ mod tests {
     #[test]
     fn cidr_membership_v6() {
         let policy =
-            AllowListPolicy::new(Some(&["2606:4700::/32".into(), "2001:db8::1".into()]), None);
+            EgressPolicy::new(Some(&["2606:4700::/32".into(), "2001:db8::1".into()]), None);
         assert!(policy.allows_v6("2606:4700::1111".parse().unwrap()));
         assert!(policy.allows_v6("2606:4700:ffff::1".parse().unwrap()));
         assert!(policy.allows_v6("2001:db8::1".parse().unwrap()));
@@ -486,7 +486,7 @@ mod tests {
 
     #[test]
     fn allow_host_gates_dns_and_learns_ips() {
-        let policy = AllowListPolicy::new(None, Some(&["example.com".into()]));
+        let policy = EgressPolicy::new(None, Some(&["example.com".into()]));
         assert!(policy.dns_filter_active());
         assert!(policy.hostname_allowed("example.com"));
         assert!(policy.hostname_allowed("www.example.com"));
@@ -507,7 +507,7 @@ mod tests {
     #[test]
     fn learned_ip_respects_min_ttl() {
         // A tiny TTL is clamped up to MIN_LEARNED_TTL, so the entry is live now.
-        let policy = AllowListPolicy::new(None, Some(&["example.com".into()]));
+        let policy = EgressPolicy::new(None, Some(&["example.com".into()]));
         let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
         policy.learn_ip_records(&[(ip, 1)]);
         assert!(policy.allows(ip));
@@ -515,7 +515,7 @@ mod tests {
 
     #[test]
     fn unparseable_cidr_is_skipped_not_panicked() {
-        let policy = AllowListPolicy::new(Some(&["nonsense".into(), "1.1.1.1".into()]), None);
+        let policy = EgressPolicy::new(Some(&["nonsense".into(), "1.1.1.1".into()]), None);
         assert!(policy.allows_v4(Ipv4Addr::new(1, 1, 1, 1)));
         assert!(!policy.allows_v4(Ipv4Addr::new(2, 2, 2, 2)));
     }

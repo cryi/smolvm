@@ -26,7 +26,7 @@
 //! - the relay thread owns the host-facing TCP socket
 //! - channels bridge payloads between them
 
-use crate::policy::EgressPolicy;
+use crate::policy::Egress;
 use crate::queues::WakePipe;
 use crate::virtio_net_log;
 use smoltcp::iface::{Interface, SocketHandle, SocketSet};
@@ -63,7 +63,7 @@ pub struct TcpRelayTable {
     max_connections: usize,
     /// Outbound allow-list applied before opening a host connection for a
     /// guest-initiated flow. Inbound published-port connections bypass it.
-    egress: EgressPolicy,
+    egress: Egress,
     /// The guest-visible gateway addresses (IPv4/IPv6/link-local). A guest flow
     /// destined to one of these is dialing "the host" via its default gateway,
     /// so the host-side relay connects to loopback instead of the gateway's own
@@ -189,11 +189,7 @@ impl RelayExitState {
 
 impl TcpRelayTable {
     /// Create a new relay table.
-    pub fn new(
-        max_connections: Option<usize>,
-        egress: EgressPolicy,
-        gateway_ips: Vec<IpAddr>,
-    ) -> Self {
+    pub fn new(max_connections: Option<usize>, egress: Egress, gateway_ips: Vec<IpAddr>) -> Self {
         Self {
             connections: HashMap::new(),
             connection_keys: HashSet::new(),
@@ -877,7 +873,11 @@ mod tests {
     fn gateway_ip_destination_dials_the_host_over_loopback() {
         let gw4: IpAddr = "100.96.0.1".parse().unwrap();
         let gw6: IpAddr = "fd00::1".parse().unwrap();
-        let table = TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![gw4, gw6]);
+        let table = TcpRelayTable::new(
+            None,
+            Arc::new(crate::egress::EgressPolicy::unrestricted()),
+            vec![gw4, gw6],
+        );
 
         // A guest reaching "the host" via its gateway IP must dial loopback, not
         // the gateway's own (non-routable) userspace address — the bug that made

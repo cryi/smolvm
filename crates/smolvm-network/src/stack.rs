@@ -53,7 +53,7 @@
 use crate::device::VirtioNetworkDevice;
 use crate::dns_relay::{self, DnsQuery, DnsResponse, DnsTransport};
 use crate::icmp_relay;
-use crate::policy::EgressPolicy;
+use crate::policy::Egress;
 use crate::queues::NetworkFrameQueues;
 use crate::tcp_listeners::AcceptedTcpConnection;
 use crate::tcp_relay::{spawn_tcp_relay, TcpRelayTable};
@@ -155,7 +155,7 @@ pub fn start_network_stack(
     queues: Arc<NetworkFrameQueues>,
     config: VirtioPollConfig,
     tcp_receiver: Option<Receiver<AcceptedTcpConnection>>,
-    egress: EgressPolicy,
+    egress: Egress,
 ) -> std::io::Result<JoinHandle<()>> {
     virtio_net_log!(
         "virtio-net: spawning poll thread guest_ip={} gateway_ip={} mtu={}",
@@ -172,7 +172,7 @@ fn run_network_stack(
     queues: Arc<NetworkFrameQueues>,
     config: VirtioPollConfig,
     mut tcp_receiver: Option<Receiver<AcceptedTcpConnection>>,
-    egress: EgressPolicy,
+    egress: Egress,
 ) {
     // Poll loop overview:
     //
@@ -563,7 +563,7 @@ fn drain_icmp_echo(
     sockets: &mut SocketSet<'_>,
     handle: SocketHandle,
     is_ipv6: bool,
-    egress: &EgressPolicy,
+    egress: &Egress,
     gateway_addrs: &[IpAddr],
     to_relay: &SyncSender<icmp_relay::IcmpEcho>,
 ) -> bool {
@@ -759,7 +759,7 @@ use crate::policy::DnsVerdict as DnsDecision;
 fn dispatch_dns_udp(
     dns_socket_handle: SocketHandle,
     sockets: &mut SocketSet<'_>,
-    egress: &EgressPolicy,
+    egress: &Egress,
     upstream_dns: Ipv4Addr,
     gateway: &mut DnsGateway,
     to_relay: &SyncSender<DnsQuery>,
@@ -828,7 +828,7 @@ fn deliver_dns_responses(
     dns_tcp_handles: &[SocketHandle],
     dns_tcp_conns: &mut [DnsTcpConn],
     sockets: &mut SocketSet<'_>,
-    egress: &EgressPolicy,
+    egress: &Egress,
     gateway: &mut DnsGateway,
     from_relay: &Receiver<DnsResponse>,
 ) {
@@ -934,7 +934,7 @@ fn process_dns_tcp(
     handles: &[SocketHandle],
     conns: &mut [DnsTcpConn],
     sockets: &mut SocketSet<'_>,
-    egress: &EgressPolicy,
+    egress: &Egress,
     upstream_dns: Ipv4Addr,
     gateway: &mut DnsGateway,
     to_relay: &SyncSender<DnsQuery>,
