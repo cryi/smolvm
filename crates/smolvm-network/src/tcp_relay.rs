@@ -942,4 +942,32 @@ mod tests {
             SocketAddr::new(public, 443),
         );
     }
+
+    /// The port reaches the policy, and a denial happens before any host socket
+    /// exists. Per-port grants are the thing the built-in policy cannot express,
+    /// so this is the plumbing an embedder actually plugs in for.
+    #[test]
+    fn a_custom_policy_gates_the_syn_by_port() {
+        struct OnlyHttps;
+
+        impl crate::policy::Policy for OnlyHttps {
+            fn allows(&self, _ip: IpAddr, port: Option<u16>) -> bool {
+                port == Some(443)
+            }
+        }
+
+        let mut table = TcpRelayTable::new(None, Arc::new(OnlyHttps), vec![]);
+        let mut sockets = SocketSet::new(vec![]);
+        let source: SocketAddr = "100.96.0.2:40000".parse().unwrap();
+        let dst = |port| SocketAddr::new("1.1.1.1".parse().unwrap(), port);
+
+        // A port the policy grants gets a guest-facing socket and a relay entry.
+        assert!(table.create_tcp_socket(source, dst(443), &mut sockets));
+        assert!(table.has_socket_for(&source, &dst(443)));
+
+        // One it does not is dropped outright — no socket, no entry, and the
+        // guest just sees the connection fail.
+        assert!(!table.create_tcp_socket(source, dst(80), &mut sockets));
+        assert!(!table.has_socket_for(&source, &dst(80)));
+    }
 }

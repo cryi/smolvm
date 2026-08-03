@@ -114,4 +114,57 @@ mod tests {
         assert!(!p.intercepts_dns());
         p.learn(&[]); // must not panic on an answer it never asked for
     }
+
+    /// Everything an embedder can plug in, reached through the handle the
+    /// gateway actually holds — so this covers the dynamic dispatch too, not
+    /// just the trait in the abstract.
+    #[test]
+    fn a_custom_policy_answers_every_hook_through_the_handle() {
+        struct Custom;
+
+        const STANDIN: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1));
+        const REAL: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1));
+
+        impl Policy for Custom {
+            fn allows(&self, ip: IpAddr, port: Option<u16>) -> bool {
+                ip == STANDIN && port == Some(5432)
+            }
+
+            fn rewrite(&self, ip: IpAddr) -> Option<IpAddr> {
+                (ip == STANDIN).then_some(REAL)
+            }
+
+            fn dns(&self, _query: &[u8]) -> DnsVerdict {
+                DnsVerdict::Immediate(vec![0xde, 0xad])
+            }
+
+            fn intercepts_dns(&self) -> bool {
+                true
+            }
+        }
+
+        let egress: Egress = Arc::new(Custom);
+        let other: IpAddr = "1.1.1.1".parse().unwrap();
+
+        // Per-port grants — what the built-in allow-list has no way to say.
+        assert!(egress.allows(STANDIN, Some(5432)));
+        assert!(!egress.allows(STANDIN, Some(22)));
+        assert!(!egress.allows(STANDIN, None));
+        assert!(!egress.allows(other, Some(5432)));
+
+        // A stand-in the policy published is dialed as what it stands for;
+        // anything else is dialed as itself.
+        assert_eq!(egress.rewrite(STANDIN), Some(REAL));
+        assert_eq!(egress.rewrite(other), None);
+
+        // The policy answers DNS itself, so the gateway must stop the guest's
+        // own resolver from going around it.
+        assert!(matches!(egress.dns(&[]), DnsVerdict::Immediate(b) if b == [0xde, 0xad]));
+        assert!(egress.intercepts_dns());
+
+        // Cloning the handle shares the policy rather than copying it.
+        let cloned = egress.clone();
+        assert!(cloned.allows(STANDIN, Some(5432)));
+        assert_eq!(Arc::strong_count(&egress), 2);
+    }
 }

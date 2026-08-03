@@ -592,4 +592,31 @@ mod tests {
             other => panic!("expected echo reply, got {other:?}"),
         }
     }
+
+    /// An echo carries no port, so the policy is asked with `None` — and only a
+    /// rule that covers every port can answer that. A policy scoped to one port
+    /// must not find itself relaying pings to the same address.
+    #[test]
+    fn a_custom_policy_sees_a_portless_flow_for_icmp() {
+        struct OnlyHttps;
+        struct AnyPort;
+
+        impl crate::policy::Policy for OnlyHttps {
+            fn allows(&self, _ip: IpAddr, port: Option<u16>) -> bool {
+                port == Some(443)
+            }
+        }
+
+        impl crate::policy::Policy for AnyPort {
+            fn allows(&self, _ip: IpAddr, _port: Option<u16>) -> bool {
+                true
+            }
+        }
+
+        let ip: IpAddr = "1.1.1.1".parse().unwrap();
+        let scoped: Egress = std::sync::Arc::new(OnlyHttps);
+        let open: Egress = std::sync::Arc::new(AnyPort);
+        assert!(!should_relay_icmp(ip, &scoped));
+        assert!(should_relay_icmp(ip, &open));
+    }
 }
