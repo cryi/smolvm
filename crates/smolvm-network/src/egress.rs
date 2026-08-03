@@ -608,4 +608,84 @@ mod tests {
             FloorMode::Strict
         ));
     }
+
+    /// An A query for `name` — enough for a policy to read the question.
+    fn query_for(name: &str) -> Vec<u8> {
+        let mut q = vec![0xab, 0xcd, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        for label in name.split('.') {
+            q.push(u8::try_from(label.len()).expect("test label fits a DNS label"));
+            q.extend_from_slice(label.as_bytes());
+        }
+        q.extend_from_slice(&[0, 0, 1, 0, 1]); // root label, QTYPE=A, QCLASS=IN
+        q
+    }
+
+    /// The DNS gate, reached the way the gateway reaches it.
+    ///
+    /// Forwarding a name upstream is what decides whether that name — and the
+    /// data a guest can encode in one — leaves the box at all. The decision used
+    /// to sit inline in `stack.rs` with no test of its own; it is a trait method
+    /// now, so pin it here.
+    #[test]
+    fn the_dns_gate_forwards_only_listed_names() {
+        let policy = EgressPolicy::new(None, Some(&["example.com".into()]));
+        let p: &dyn Policy = &policy;
+
+        // A listed name, and anything under it, goes upstream and is learned so
+        // the connection that follows passes.
+        for allowed in ["example.com", "www.example.com"] {
+            assert!(
+                matches!(
+                    p.dns(&query_for(allowed)),
+                    DnsVerdict::Forward { learn: true }
+                ),
+                "{allowed} should be forwarded"
+            );
+        }
+        // Everything else is answered here rather than sent on: NXDOMAIN for a
+        // name nobody listed, SERVFAIL for a query that will not parse.
+        for refused in ["evil.test", "example.com.evil.test", "notexample.com"] {
+            assert!(
+                matches!(p.dns(&query_for(refused)), DnsVerdict::Immediate(_)),
+                "{refused} must not reach the resolver"
+            );
+        }
+        assert!(matches!(p.dns(&[0, 1, 2]), DnsVerdict::Immediate(_)));
+
+        // No allow-host list: nothing is filtered, and nothing is learned either
+        // — otherwise resolving any name would defeat `allowed_cidrs`.
+        let open = EgressPolicy::unrestricted();
+        let o: &dyn Policy = &open;
+        assert!(matches!(
+            o.dns(&query_for("anything.test")),
+            DnsVerdict::Forward { learn: false }
+        ));
+    }
+
+    /// The rest of the trait surface: the built-in policy learns from raw answer
+    /// bytes, ignores ports, rewrites nothing, and answers no name itself.
+    #[test]
+    fn the_builtin_policy_learns_from_bytes_and_ignores_ports() {
+        let policy = EgressPolicy::new(None, Some(&["example.com".into()]));
+        let p: &dyn Policy = &policy;
+        let ip = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+        assert!(!p.allows(ip, Some(443)));
+
+        // `learn` is handed the answer whole, question and all.
+        p.learn(&dns::build_ip_response(
+            &query_for("example.com"),
+            &[ip],
+            300,
+        ));
+        // Learned, and on every port: ports are not this policy's vocabulary, so
+        // a consumer needing them implements its own.
+        for port in [Some(443), Some(22), None] {
+            assert!(p.allows(ip, port), "{port:?} should be allowed");
+        }
+
+        // It publishes no stand-in address and answers no name, so the gateway
+        // has nothing to rewrite and no reason to intercept TCP/53 for it.
+        assert_eq!(p.rewrite(ip), None);
+        assert!(!p.intercepts_dns());
+    }
 }

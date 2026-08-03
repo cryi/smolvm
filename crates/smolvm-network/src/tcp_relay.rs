@@ -899,4 +899,47 @@ mod tests {
             SocketAddr::new(lan, 3306),
         );
     }
+
+    /// A policy that publishes one stand-in address and keeps the real
+    /// destination to itself.
+    struct StandinPolicy;
+
+    /// RFC 5737 TEST-NET-1: never a real destination.
+    const STANDIN: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+    const REAL: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3));
+
+    impl crate::policy::Policy for StandinPolicy {
+        fn allows(&self, _ip: IpAddr, _port: Option<u16>) -> bool {
+            true
+        }
+
+        fn rewrite(&self, ip: IpAddr) -> Option<IpAddr> {
+            (ip == STANDIN).then_some(REAL)
+        }
+    }
+
+    #[test]
+    fn a_policy_rewrite_takes_precedence_over_the_gateway_ip_redirect() {
+        let gw: IpAddr = "100.96.0.1".parse().unwrap();
+        let table = TcpRelayTable::new(None, Arc::new(StandinPolicy), vec![gw]);
+
+        // The policy gets first say: its stand-in is dialed as what it stands
+        // for, with the port the guest asked for.
+        assert_eq!(
+            table.host_connect_addr(SocketAddr::new(STANDIN, 5432)),
+            SocketAddr::new(REAL, 5432),
+        );
+        // The gateway-IP redirect still covers everything the policy leaves
+        // alone, so the two mechanisms do not shadow each other.
+        assert_eq!(
+            table.host_connect_addr(SocketAddr::new(gw, 8080)),
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080),
+        );
+        // ...and an ordinary destination is dialed unchanged.
+        let public: IpAddr = "1.1.1.1".parse().unwrap();
+        assert_eq!(
+            table.host_connect_addr(SocketAddr::new(public, 443)),
+            SocketAddr::new(public, 443),
+        );
+    }
 }
