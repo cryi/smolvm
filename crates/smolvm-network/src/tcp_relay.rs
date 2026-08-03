@@ -218,11 +218,6 @@ impl TcpRelayTable {
     /// multi-tenant `Strict` floor the gateway/CGNAT range is refused before it
     /// reaches here — this redirect only applies where reaching the host is the
     /// intended, local-default behavior.
-    ///
-    /// The egress policy gets first say, for a destination it published to the
-    /// guest as a stand-in for somewhere else. Either way the guest-facing
-    /// smoltcp socket keeps the address the guest used, so replies come back
-    /// from the address it dialed.
     fn host_connect_addr(&self, destination: SocketAddr) -> SocketAddr {
         if let Some(ip) = self.egress.rewrite(destination.ip()) {
             return SocketAddr::new(ip, destination.port());

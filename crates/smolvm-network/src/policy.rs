@@ -1,68 +1,35 @@
-//! Pluggable egress policy for the virtio-net backend.
-//!
-//! Context
-//! =======
-//!
-//! The gateway terminates every guest flow itself, so it is the one place that
-//! decides what a guest may reach — and that decision belongs to whoever embeds
-//! the gateway, not this crate. It used to be fixed: the `allowed_cidrs` +
-//! `--allow-host` allow-list in [`crate::egress`], compiled in. An embedder
-//! wanting other grants — a port on a rule, a name the gateway answers itself,
-//! a stand-in address for a host-local service — had nowhere to put them but
-//! that file.
-//!
-//! So the decision is a trait. The gateway keeps the mechanism (terminating
-//! flows, intercepting DNS, relaying) and asks a [`Policy`] as it goes:
-//!
-//! ```text
-//! guest TCP SYN / UDP datagram
-//!   -> allows(ip, port)?
-//!        no  -> dropped before any host socket exists
-//!        yes -> rewrite(ip)? -> dial that instead, else dial ip as-is
-//!
-//! guest :53 query  (UDP always; TCP too when intercepts_dns())
-//!   -> dns(query)
-//!        Immediate(bytes)  -> answered here, nothing leaves the host
-//!        Forward { learn } -> forwarded upstream, and if learn the answer
-//!                             comes back through learn(answer)
-//! ```
-//!
-//! [`crate::egress::EgressPolicy`] implements the trait with the
-//! `allowed_cidrs` + `--allow-host` semantics libkrun's TSI path uses, and is
-//! what the launchers build — the default, not the only shape. The gateway owns
-//! a policy as a [`PolicyHandle`], cloning that into each relay thread; the
-//! parts that only ask it questions take a plain `&dyn Policy`.
+//! The egress decision as a trait the gateway asks. The gateway terminates
+//! every guest flow itself, so it is the one place that decides what a guest
+//! may reach — and that decision belongs to whoever embeds the gateway, not
+//! this crate. The built-in implementation is [`crate::egress::EgressPolicy`],
+//! with the `allowed_cidrs` + `--allow-host` semantics libkrun's TSI path
+//! uses.
 
 use std::net::IpAddr;
 use std::sync::Arc;
 
 /// What the gateway should do with one guest DNS query.
 pub enum DnsDecision {
-    /// Answer the guest with these raw DNS bytes, no upstream query — a
-    /// refusal is an answer too (NXDOMAIN, SERVFAIL).
+    /// Answer the guest with these raw DNS bytes, no upstream query. A refusal
+    /// is an answer too (NXDOMAIN, SERVFAIL).
     Immediate(Vec<u8>),
-    /// Forward the query upstream; `learn` true echoes the answer back through
-    /// [`Policy::learn`] when it arrives.
+    /// Forward upstream; `learn` echoes the answer back through
+    /// [`Policy::learn`].
     Forward { learn: bool },
 }
 
 /// The egress policy the gateway enforces. Every method runs on the gateway's
 /// poll thread: keep them cheap and non-blocking, no host I/O.
 pub trait Policy: Send + Sync {
-    /// Whether an outbound flow to `ip` may be opened. `port` is `None` for a
-    /// portless flow (an ICMP echo), which only an any-port rule covers.
-    /// Called before any host socket exists, so a denial just fails the
-    /// connection.
+    /// Whether an outbound flow to `ip` may be opened, decided before any host
+    /// socket exists. `port` is `None` for a portless flow (an ICMP echo),
+    /// which only an any-port rule covers.
     fn allows(&self, ip: IpAddr, port: Option<u16>) -> bool;
 
-    /// The address to dial in place of `ip` — the real destination behind a
-    /// stand-in this policy published. The guest-facing socket keeps `ip`, so
-    /// replies still come addressed as the guest dialed. `None` (the default)
-    /// dials `ip` unchanged.
-    ///
-    /// [`Self::allows`] judges the guest's address, never the rewrite:
-    /// publishing the stand-in is what authorizes the target, so an
-    /// unpublished stand-in is denied there, not translated here.
+    /// The address to dial in place of `ip`, for a stand-in this policy
+    /// published; `None` (the default) dials `ip`. The guest-facing socket
+    /// keeps `ip` either way, and [`Self::allows`] judges that address rather
+    /// than the rewrite — publishing a stand-in is what authorizes it.
     fn rewrite(&self, _ip: IpAddr) -> Option<IpAddr> {
         None
     }
@@ -72,26 +39,20 @@ pub trait Policy: Send + Sync {
         DnsDecision::Forward { learn: false }
     }
 
-    /// An upstream answer to a query [`Self::dns`] asked to learn from; the
+    /// An upstream answer to a query [`Self::dns`] asked to learn from. The
     /// answer echoes its question, so the name is recoverable.
     fn learn(&self, _answer: &[u8]) {}
 
     /// Whether every DNS query must reach [`Self::dns`], even TCP/53 to a
-    /// resolver the guest picked. A name-*filtering* policy can leave this
-    /// false (an unlisted resolver is already blocked by [`Self::allows`]); a
-    /// name-*answering* one must set it, or the guest's own resolver quietly
-    /// wins.
+    /// resolver the guest picked. A policy that *answers* names must set it, or
+    /// that resolver quietly wins.
     fn intercepts_dns(&self) -> bool {
         false
     }
 }
 
-/// A policy the gateway owns and clones into its relay threads.
-///
-/// Refcounted, not a token: unlike `SocketHandle` elsewhere in this crate, this
-/// handle *is* the policy rather than an index to one, and cloning it shares the
-/// same object. That is the point — every thread that can open a host socket
-/// consults one policy, not a copy that could drift from it.
+/// A policy the gateway clones into its relay threads. Cloning shares one
+/// policy rather than copying it.
 pub type PolicyHandle = Arc<dyn Policy>;
 
 #[cfg(test)]
@@ -107,10 +68,8 @@ mod tests {
         }
     }
 
-    /// The defaults are what a policy inherits by saying nothing, so they are
-    /// part of the contract: saying nothing must not opt a policy into
-    /// rewriting destinations, answering DNS, or swallowing the guest's own
-    /// resolver.
+    /// Saying nothing must not opt a policy into rewriting destinations,
+    /// answering DNS, or swallowing the guest's resolver.
     #[test]
     fn the_defaults_add_nothing_a_policy_did_not_ask_for() {
         let p: &dyn Policy = &AllowAll;
@@ -120,9 +79,8 @@ mod tests {
         p.learn(&[]); // must not panic on an answer it never asked for
     }
 
-    /// Everything an embedder can plug in, reached through the handle the
-    /// gateway actually holds — so this covers the dynamic dispatch too, not
-    /// just the trait in the abstract.
+    /// Every hook, through the handle the gateway holds — so this covers the
+    /// dynamic dispatch too.
     #[test]
     fn a_custom_policy_answers_every_hook_through_the_handle() {
         struct Custom;
@@ -157,17 +115,12 @@ mod tests {
         assert!(!egress.allows(STANDIN, None));
         assert!(!egress.allows(other, Some(5432)));
 
-        // A stand-in the policy published is dialed as what it stands for;
-        // anything else is dialed as itself.
         assert_eq!(egress.rewrite(STANDIN), Some(REAL));
         assert_eq!(egress.rewrite(other), None);
-
-        // The policy answers DNS itself, so the gateway must stop the guest's
-        // own resolver from going around it.
         assert!(matches!(egress.dns(&[]), DnsDecision::Immediate(b) if b == [0xde, 0xad]));
         assert!(egress.intercepts_dns());
 
-        // Cloning the handle shares the policy rather than copying it.
+        // Cloning shares the policy rather than copying it.
         let cloned = egress.clone();
         assert!(cloned.allows(STANDIN, Some(5432)));
         assert_eq!(Arc::strong_count(&egress), 2);

@@ -14,12 +14,6 @@
 //!
 //! Disallowed destinations are dropped before any host socket is created. DNS
 //! forwarding (gateway-internal) is never gated by this filter.
-//!
-//! This is the *built-in* policy, and the gateway holds it behind the
-//! [`Policy`](crate::policy::Policy) trait: a consumer needing different rules
-//! implements that instead of extending this file. [`Cidr`], [`FloorMode`] and
-//! [`is_floored`] are public so it can reuse the parts worth sharing — above
-//! all the floor, which no consumer should be redefining for itself.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -349,9 +343,8 @@ impl EgressPolicy {
     }
 }
 
-/// The allow-list as the gateway's pluggable [`Policy`]. Ports play no part in
-/// it — a consumer wanting per-port grants writes its own implementation — so
-/// `port` is ignored and every DNS answer for an allowed name is learned whole.
+/// The gateway's built-in policy, portless and address-scoped — a consumer
+/// with different grants implements [`Policy`] itself.
 impl Policy for EgressPolicy {
     fn allows(&self, ip: IpAddr, _port: Option<u16>) -> bool {
         EgressPolicy::allows(self, ip)
