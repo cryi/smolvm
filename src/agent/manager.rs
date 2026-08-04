@@ -33,6 +33,25 @@ const AGENT_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// Timeout when waiting for agent to stop.
 const WAIT_FOR_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn should_retry_kvm_enomem(cpus: u8, fork_clone: bool) -> bool {
+    cpus == 1 || fork_clone
+}
+
+#[cfg(unix)]
+fn needs_managed_cuda_daemon(
+    cuda: bool,
+    fork_context: bool,
+    shared_setting: Option<&str>,
+    external_daemon: bool,
+) -> bool {
+    cuda && !external_daemon
+        && match shared_setting {
+            Some(value) => value == "1",
+            None => fork_context,
+        }
+}
+
 /// Running VM configuration persisted to disk so new CLI invocations
 /// can restore the actual config of a detached VM.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1676,6 +1695,35 @@ impl AgentManager {
 
         let t_launch = Instant::now();
 
+        // A privileged node drops each VMM to a distinct uid. Start the shared
+        // CUDA daemon while this manager still has access to the node data dir;
+        // the isolated VMM then only needs permission to connect to its socket.
+        // Forkable CUDA cannot safely fall back in-process because restored
+        // clones must reconnect to the golden's daemon-owned device state.
+        #[cfg(unix)]
+        {
+            let shared_setting = std::env::var("SMOLVM_CUDA_SHARED").ok();
+            let external_daemon = std::env::var_os("SMOLVM_CUDA_DAEMON").is_some();
+            let fork_context = features.forkable || features.snapshot_dir.is_some();
+            if needs_managed_cuda_daemon(
+                features.cuda || resources.cuda,
+                fork_context,
+                shared_setting.as_deref(),
+                external_daemon,
+            ) {
+                let daemon_executable = match std::env::var_os("SMOLVM_BOOT_BINARY") {
+                    Some(path) => PathBuf::from(path),
+                    None => std::env::current_exe()
+                        .map_err(|error| Error::agent("find smolvm binary", error.to_string()))?,
+                };
+                crate::cuda_daemon::ensure_running_with_executable(
+                    &daemon_executable,
+                    fork_context,
+                )
+                .map_err(|error| Error::agent("start shared CUDA daemon", error.to_string()))?;
+            }
+        }
+
         let cpu_policy = std::env::var("SMOLVM_CUDA_FORK_CPU_POLICY")
             .ok()
             .map(|value| value.trim().to_ascii_lowercase())
@@ -1759,19 +1807,25 @@ impl AgentManager {
             if let Some(limit_mib) = features.cuda_vram_limit_mib {
                 v.push(("SMOLVM_CUDA_VRAM_LIMIT_MB", limit_mib.to_string()));
             }
-            // Some KVM kernels return a spurious ENOMEM when a one-vCPU VM
-            // enters KVM too soon after vCPU creation. Delay that first entry
-            // and retain bounded retries without delaying normal guest exits.
+            let fork_clone = features.snapshot_dir.is_some();
+            let cuda_clone = fork_clone && (features.cuda || resources_for_config.cuda);
+            // Some KVM kernels return a spurious ENOMEM while concurrent fork
+            // clones enter KVM. Keep the first-entry delay specific to one-vCPU
+            // guests, but enable the bounded retry path for every fork clone;
+            // retries add no delay unless KVM actually returns ENOMEM.
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             if resources_for_config.cpus == 1 {
                 v.push(("KRUN_FIRST_RUN_DELAY", "1".to_string()));
+            }
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            if should_retry_kvm_enomem(resources_for_config.cpus, fork_clone) {
                 v.push(("KRUN_ENOMEM_RETRY", "1".to_string()));
             }
             // A CUDA fork clone must stay ptrace-readable by the same-uid daemon
             // /worker: the proc-mem live-RAM transport preads /proc/<pid>/mem for
             // D2H/H2D, so the clone must NOT harden to dumpable=0. Same same-uid
             // exposure the forkable golden already accepts (single-tenant).
-            if features.snapshot_dir.is_some() && (features.cuda || resources_for_config.cuda) {
+            if cuda_clone {
                 v.push(("SMOLVM_CUDA_CLONE_PTRACEABLE", "1".to_string()));
             }
             // Shared CUDA daemon: forward an explicit operator setting as-is.
@@ -1798,9 +1852,10 @@ impl AgentManager {
             // pattern as SHARED above: a CUDA golden's clones need the daemon in
             // address-preserving per-clone-worker mode or default-config torch
             // (expandable_segments) forks into a broken clone. Explicit operator
-            // settings win. The daemon reads these at ITS spawn (inherited from
-            // this VM's boot process via ensure_running), so a daemon already
-            // running in another mode keeps that mode until restarted.
+            // settings win. Both the privileged manager prestart above and the
+            // VM boot fallback propagate these defaults to a newly spawned
+            // daemon; a daemon already running in another mode keeps that mode
+            // until restarted.
             for flag in ["SMOLVM_CUDA_FORK_WORKERS", "SMOLVM_CUDA_FORK_ISOLATE"] {
                 if std::env::var_os(flag).is_none()
                     && (features.forkable || features.snapshot_dir.is_some())
@@ -2006,6 +2061,43 @@ impl AgentManager {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| exe.clone());
         let mut cmd = std::process::Command::new(&boot_exe);
+        // libkrun dlopen()s libkrunfw by bare soname at krun_start_enter time and
+        // carries no rpath, so the dynamic linker must be told where to look
+        // BEFORE the child launches — the loader caches its search path at
+        // process start, so the set_var the launcher does inside the child is too
+        // late for that inner dlopen. Point it at the dirs holding the libs: an
+        // explicit SMOLVM_LIB_DIR, the directory next to the boot binary (the
+        // bundled SDK ships smol-vmm beside libkrun/libkrunfw), and that dir's
+        // `lib/` subdir (the CLI tarball layout). Existing value is preserved.
+        // Without this, in-process embedders that don't inherit a wrapper's
+        // DYLD_LIBRARY_PATH (the Node/Bun SDK) fail every local boot with
+        // "Couldn't find or load libkrunfw" → krun_start_enter -2.
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let mut search: Vec<std::path::PathBuf> = Vec::new();
+            if let Some(dir) = std::env::var_os("SMOLVM_LIB_DIR") {
+                search.push(std::path::PathBuf::from(dir));
+            }
+            if let Some(parent) = boot_exe.parent() {
+                search.push(parent.to_path_buf());
+                search.push(parent.join("lib"));
+            }
+            let var = if cfg!(target_os = "macos") {
+                "DYLD_LIBRARY_PATH"
+            } else {
+                "LD_LIBRARY_PATH"
+            };
+            if let Some(existing) = std::env::var_os(var) {
+                if !existing.is_empty() {
+                    search.push(std::path::PathBuf::from(existing));
+                }
+            }
+            if !search.is_empty() {
+                if let Ok(joined) = std::env::join_paths(search) {
+                    cmd.env(var, joined);
+                }
+            }
+        }
         cmd.args(["_boot-vm", &config_path.to_string_lossy()])
             .env(
                 "SMOLVM_BOOT_WATCH_PARENT",
@@ -2086,18 +2178,19 @@ impl AgentManager {
         // SMOLVM_VM_USE_SCOPE at startup and did NOT set SMOLVM_CGROUP_ROOT, so the
         // boot subprocess skipped self-placement and the VM is still in serve's
         // cgroup for this microsecond window — the adopt moves it out. Caps mirror
-        // process::place_in_cgroup (CGROUP_MEM_OVERHEAD_MIB=768, CGROUP_PIDS_MAX
+        // process::place_in_cgroup (VMM_MEM_OVERHEAD_MIB=768, CGROUP_PIDS_MAX
         // =1024) as scope properties. Best-effort: on failure the VM keeps running
         // (just not restart-safe), same as an uncapped cgroup join.
         #[cfg(target_os = "linux")]
         if std::env::var_os("SMOLVM_VM_USE_SCOPE").is_some() {
             if let Some(name) = self.name() {
                 let caps = crate::systemd_scope::ScopeCaps {
-                    memory_max_bytes: Some(
-                        (resources_for_config.memory_mib as u64 + 768) * 1024 * 1024,
-                    ),
+                    memory_max_bytes: Some(crate::process::vmm_memory_limit_bytes(
+                        resources_for_config.memory_mib,
+                        config.cuda,
+                    )),
                     cpu_quota_usec_per_sec: Some(
-                        (resources_for_config.cpus.max(1) as u64) * 1_000_000,
+                        u64::from(resources_for_config.cpus.max(1)) * 1_000_000,
                     ),
                     tasks_max: Some(1024),
                 };
@@ -2792,6 +2885,24 @@ fn boot_failure_reason(exit_code: Option<i32>, startup_log: Option<&str>) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn kvm_enomem_retries_cover_multi_vcpu_fork_clones() {
+        assert!(should_retry_kvm_enomem(1, false));
+        assert!(should_retry_kvm_enomem(3, true));
+        assert!(!should_retry_kvm_enomem(3, false));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn managed_cuda_daemon_is_mandatory_for_automatic_forking() {
+        assert!(needs_managed_cuda_daemon(true, true, None, false));
+        assert!(needs_managed_cuda_daemon(true, false, Some("1"), false));
+        assert!(!needs_managed_cuda_daemon(false, true, None, false));
+        assert!(!needs_managed_cuda_daemon(true, true, Some("0"), false));
+        assert!(!needs_managed_cuda_daemon(true, true, None, true));
+    }
 
     // The distro-package case: the rootfs directory is not writable by the user
     // running smolvm, so the guest's marker write can never succeed. Detecting

@@ -12,11 +12,11 @@
 use crate::config::VmRecord;
 use crate::error::{Error, Result};
 use crate::pool::{
-    ClaimForkPoolSlot, ForkLeaseRecord, ForkLeaseState, ForkPoolRecord, ForkPoolSlotRecord,
-    ForkPoolSlotState,
+    ClaimForkPoolSlot, ForkLeaseRecord, ForkLeaseState, ForkPoolAdmissionLimit, ForkPoolRecord,
+    ForkPoolSlotRecord, ForkPoolSlotState,
 };
 use parking_lot::{Condvar, Mutex};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -46,7 +46,7 @@ pub struct ForkPoolSlotClaim<'a> {
     /// Reject workers whose `/workspace` is backed by an external mount.
     pub require_private_workspace: bool,
     /// Runtime-calibrated active-lease ceiling, applied with the durable limit.
-    pub admission_limit: Option<u32>,
+    pub admission_limit: Option<ForkPoolAdmissionLimit>,
     /// Lease lifetime renewed by each heartbeat.
     pub ttl_secs: u64,
     /// Timestamp used for every record in this transaction.
@@ -268,6 +268,10 @@ impl SmolvmDb {
              );
              CREATE TABLE IF NOT EXISTS fork_pools (
                  name TEXT PRIMARY KEY NOT NULL,
+                 data BLOB NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS fork_pool_snapshots (
+                 golden TEXT PRIMARY KEY NOT NULL,
                  data BLOB NOT NULL
              );
              CREATE TABLE IF NOT EXISTS fork_pool_slots (
@@ -614,7 +618,11 @@ impl SmolvmDb {
         F: FnOnce(&mut VmRecord),
     {
         self.with_conn(|conn| {
-            let tx = conn.transaction().db_err("begin transaction")?;
+            // Reserve the writer before reading. A deferred transaction can
+            // fail with SQLITE_BUSY_SNAPSHOT when it upgrades to a write.
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .db_err("begin transaction")?;
 
             let data: Option<Vec<u8>> = tx
                 .query_row(
@@ -695,6 +703,61 @@ impl SmolvmDb {
                 pools.push(serde_json::from_slice(&bytes).db_err("deserialize fork pool")?);
             }
             Ok(pools)
+        })
+    }
+
+    /// Durably publish the RAM checkpoint that can refill pools for one golden.
+    pub(crate) fn set_fork_pool_snapshot(
+        &self,
+        golden: &str,
+        snapshot: &crate::agent::fork::RetainedForkSnapshot,
+    ) -> Result<()> {
+        let data = serde_json::to_vec(snapshot).db_err("serialize fork pool snapshot")?;
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO fork_pool_snapshots (golden, data) VALUES (?1, ?2)
+                 ON CONFLICT(golden) DO UPDATE SET data = excluded.data",
+                params![golden, data],
+            )
+            .db_err(format!("set fork pool snapshot for '{golden}'"))?;
+            Ok(())
+        })
+    }
+
+    /// Load every retained pool checkpoint after a controller restart.
+    pub(crate) fn list_fork_pool_snapshots(
+        &self,
+    ) -> Result<Vec<(String, crate::agent::fork::RetainedForkSnapshot)>> {
+        self.with_read_conn(|conn| {
+            let mut stmt = conn
+                .prepare_cached("SELECT golden, data FROM fork_pool_snapshots ORDER BY golden")
+                .db_err("prepare list fork pool snapshots")?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .db_err("query fork pool snapshots")?;
+            let mut snapshots = Vec::new();
+            for row in rows {
+                let (golden, data) = row.db_err("read fork pool snapshot row")?;
+                let snapshot = serde_json::from_slice(&data)
+                    .db_err(format!("deserialize fork pool snapshot for '{golden}'"))?;
+                snapshots.push((golden, snapshot));
+            }
+            Ok(snapshots)
+        })
+    }
+
+    /// Forget a checkpoint only after its golden is resumed or no pool can use it.
+    pub(crate) fn remove_fork_pool_snapshot(&self, golden: &str) -> Result<bool> {
+        self.with_conn(|conn| {
+            let changed = conn
+                .execute(
+                    "DELETE FROM fork_pool_snapshots WHERE golden = ?1",
+                    params![golden],
+                )
+                .db_err(format!("remove fork pool snapshot for '{golden}'"))?;
+            Ok(changed == 1)
         })
     }
 
@@ -825,6 +888,17 @@ impl SmolvmDb {
             if pool.deleting {
                 return Ok(0);
             }
+            let activating: u32 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM fork_pool_slots
+                     WHERE pool_name = ?1 AND state = 'activating'",
+                    params![pool_name],
+                    |row| row.get(0),
+                )
+                .db_err("count activating fork pool slots")?;
+            if activating > 0 {
+                return Ok(0);
+            }
             let available: u32 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM fork_pool_slots
@@ -890,6 +964,19 @@ impl SmolvmDb {
             if pool.deleting {
                 tx.commit()
                     .db_err("commit deleting fork pool reservation")?;
+                return Ok(false);
+            }
+            let activating: u32 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM fork_pool_slots
+                     WHERE pool_name = ?1 AND state = 'activating'",
+                    params![pool_name],
+                    |row| row.get(0),
+                )
+                .db_err("count activating fork pool slots")?;
+            if activating > 0 {
+                tx.commit()
+                    .db_err("commit deferred fork pool reservation")?;
                 return Ok(false);
             }
             let available: u32 = tx
@@ -1035,7 +1122,12 @@ impl SmolvmDb {
             now,
         } = claim;
         self.with_conn(|conn| {
-            let tx = conn.transaction().db_err("begin fork pool claim")?;
+            // Take the SQLite writer reservation before reading any capacity
+            // counters. Concurrent claims on different pools can otherwise
+            // both observe the same device headroom before either inserts.
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .db_err("begin fork pool claim")?;
             if let Some(bytes) = tx
                 .query_row(
                     "SELECT data FROM fork_leases
@@ -1069,7 +1161,8 @@ impl SmolvmDb {
                 tx.commit().db_err("commit deleting fork pool claim")?;
                 return Ok(ClaimForkPoolSlot::PoolDeleting);
             }
-            let max_active = match (pool.max_active, admission_limit) {
+            let adaptive_pool_limit = admission_limit.map(|limit| limit.pool);
+            let max_active = match (pool.max_active, adaptive_pool_limit) {
                 (Some(configured), Some(adaptive)) => Some(configured.min(adaptive)),
                 (Some(configured), None) => Some(configured),
                 (None, adaptive) => adaptive,
@@ -1085,6 +1178,57 @@ impl SmolvmDb {
                     .db_err("count active fork leases")?;
                 if active >= max_active {
                     tx.commit().db_err("commit fork pool capacity check")?;
+                    return Ok(ClaimForkPoolSlot::AtCapacity);
+                }
+            }
+            if let (Some(limit), Some(device_ordinal)) =
+                (admission_limit, pool.admission_device_ordinal())
+            {
+                let active_on_device = {
+                    let mut stmt = tx
+                        .prepare_cached(
+                            "SELECT pool_name, COUNT(*) FROM fork_leases
+                             WHERE state IN ('activating', 'active')
+                             GROUP BY pool_name",
+                        )
+                        .db_err("prepare active device lease count")?;
+                    let rows = stmt
+                        .query_map([], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+                        })
+                        .db_err("query active device lease count")?;
+                    let mut active = 0_u32;
+                    for row in rows {
+                        let (active_pool_name, count) =
+                            row.db_err("read active device lease count")?;
+                        let active_pool = if active_pool_name == pool_name {
+                            Some(pool.clone())
+                        } else {
+                            tx.query_row(
+                                "SELECT data FROM fork_pools WHERE name = ?1",
+                                params![active_pool_name],
+                                |row| row.get::<_, Vec<u8>>(0),
+                            )
+                            .optional()
+                            .db_err("read active lease pool for device admission")?
+                            .map(|bytes| {
+                                serde_json::from_slice::<ForkPoolRecord>(&bytes)
+                                    .db_err("deserialize active lease pool")
+                            })
+                            .transpose()?
+                        };
+                        if active_pool
+                            .as_ref()
+                            .and_then(ForkPoolRecord::admission_device_ordinal)
+                            == Some(device_ordinal)
+                        {
+                            active = active.saturating_add(count);
+                        }
+                    }
+                    active
+                };
+                if active_on_device >= limit.device {
+                    tx.commit().db_err("commit CUDA device capacity check")?;
                     return Ok(ClaimForkPoolSlot::AtCapacity);
                 }
             }
@@ -1194,7 +1338,7 @@ impl SmolvmDb {
                 payload_sha256: payload_sha256.map(str::to_owned),
                 created_at: now,
                 updated_at: now,
-                expires_at: now.saturating_add(ttl_secs),
+                expires_at: now.saturating_add(crate::pool::FORK_LEASE_ACTIVATION_GRACE_SECS),
                 ttl_secs,
                 last_error: None,
             };
@@ -1311,6 +1455,12 @@ impl SmolvmDb {
             }
             lease.state = next;
             lease.updated_at = now;
+            if expected == ForkLeaseState::Activating && next == ForkLeaseState::Active {
+                // The configured TTL is runtime ownership time. Payload staging
+                // and guest release can be delayed by host contention, so start
+                // its countdown only after activation commits.
+                lease.expires_at = now.saturating_add(lease.ttl_secs);
+            }
             lease.last_error = error.clone();
             let updated = serde_json::to_vec(&lease).db_err("serialize fork lease")?;
             tx.execute(
@@ -1837,6 +1987,52 @@ mod tests {
         assert!(db.get_vm("test-vm").unwrap().is_none());
     }
 
+    #[test]
+    fn concurrent_vm_updates_wait_instead_of_failing_busy_snapshot() {
+        let (_dir, db) = temp_db();
+        for name in ["slot-0", "slot-1"] {
+            db.insert_vm(
+                name,
+                &VmRecord::new(name.to_string(), 1, 256, vec![], vec![], false),
+            )
+            .unwrap();
+        }
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_db = db.clone();
+        let first = std::thread::spawn(move || {
+            first_db.update_vm("slot-0", |record| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                record.forkpoint_held = false;
+            })
+        });
+        entered_rx.recv().unwrap();
+
+        let (second_started_tx, second_started_rx) = std::sync::mpsc::channel();
+        let (second_entered_tx, second_entered_rx) = std::sync::mpsc::channel();
+        let second_db = db.clone();
+        let second = std::thread::spawn(move || {
+            second_started_tx.send(()).unwrap();
+            second_db.update_vm("slot-1", |record| {
+                second_entered_tx.send(()).unwrap();
+                record.forkpoint_held = false;
+            })
+        });
+        second_started_rx.recv().unwrap();
+        let entered_while_first_active = second_entered_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_ok();
+        release_tx.send(()).unwrap();
+
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+        assert!(!entered_while_first_active);
+        assert!(!db.get_vm("slot-0").unwrap().unwrap().forkpoint_held);
+        assert!(!db.get_vm("slot-1").unwrap().unwrap().forkpoint_held);
+    }
+
     /// A read must not block behind a stalled write. Before the connection pool,
     /// every db call shared one `Mutex<Connection>`, so a write stalled on
     /// SQLite's `busy_timeout` held that mutex and serialized ALL reads behind
@@ -1928,6 +2124,27 @@ mod tests {
         assert_eq!(value, "test_value");
 
         assert!(db.get_config("nonexistent").unwrap().is_none());
+    }
+
+    #[test]
+    fn fork_pool_snapshot_survives_database_reopen_and_can_be_removed() {
+        let (dir, db) = temp_db();
+        let snapshot = crate::agent::fork::RetainedForkSnapshot {
+            path: PathBuf::from("/golden/s/12345678"),
+            golden_pid: 123,
+            golden_pid_start_time: 456,
+        };
+        db.set_fork_pool_snapshot("golden", &snapshot).unwrap();
+        drop(db);
+
+        let reopened = SmolvmDb::open_at(&dir.path().join("test.db")).unwrap();
+        assert_eq!(
+            reopened.list_fork_pool_snapshots().unwrap(),
+            vec![("golden".to_string(), snapshot)]
+        );
+        assert!(reopened.remove_fork_pool_snapshot("golden").unwrap());
+        assert!(reopened.list_fork_pool_snapshots().unwrap().is_empty());
+        assert!(!reopened.remove_fork_pool_snapshot("golden").unwrap());
     }
 
     #[test]
@@ -2043,6 +2260,7 @@ mod tests {
             desired_ready,
             max_active: None,
             auto_admission: false,
+            cuda_device_ordinal: Some(0),
             share_weights: true,
             ready_timeout_secs: 30,
             lease_ttl_secs: 60,
@@ -2171,6 +2389,40 @@ mod tests {
             })
             .unwrap();
         assert_eq!(second_request, ClaimForkPoolSlot::NoReadySlot);
+    }
+
+    #[test]
+    fn fork_pool_refill_waits_for_guest_activation() {
+        let (_dir, db) = temp_db();
+        db.insert_fork_pool_if_not_exists(&test_pool("rollouts", 2))
+            .unwrap();
+        insert_ready_pool_slot(&db, "rollouts", "slot-1");
+        insert_ready_pool_slot(&db, "rollouts", "slot-2");
+
+        let claim = db
+            .claim_fork_pool_slot(ForkPoolSlotClaim {
+                pool_name: "rollouts",
+                lease_id: "lease-a",
+                idempotency_key: "request-a",
+                assignment: &[],
+                payload_sha256: None,
+                require_private_workspace: false,
+                admission_limit: None,
+                ttl_secs: 60,
+                now: 200,
+            })
+            .unwrap();
+        assert!(matches!(claim, ClaimForkPoolSlot::Claimed(_)));
+        assert_eq!(db.fork_pool_ready_deficit("rollouts").unwrap(), 0);
+        assert!(!db
+            .reserve_fork_pool_slot("rollouts", "replacement", 201)
+            .unwrap());
+
+        db.mark_fork_lease_active("lease-a", 202).unwrap();
+        assert_eq!(db.fork_pool_ready_deficit("rollouts").unwrap(), 1);
+        assert!(db
+            .reserve_fork_pool_slot("rollouts", "replacement", 203)
+            .unwrap());
     }
 
     #[test]
@@ -2371,7 +2623,7 @@ mod tests {
             insert_ready_pool_slot(&db, "rollouts", machine);
         }
 
-        let claim = |lease_id: &str, request: &str, admission_limit| {
+        let claim = |lease_id: &str, request: &str, admission_limit: Option<u32>| {
             db.claim_fork_pool_slot(ForkPoolSlotClaim {
                 pool_name: "rollouts",
                 lease_id,
@@ -2379,7 +2631,8 @@ mod tests {
                 assignment: &[],
                 payload_sha256: None,
                 require_private_workspace: false,
-                admission_limit,
+                admission_limit: admission_limit
+                    .map(|pool| ForkPoolAdmissionLimit { pool, device: 3 }),
                 ttl_secs: 60,
                 now: 200,
             })
@@ -2402,6 +2655,142 @@ mod tests {
             claim("lease-3", "request-3", Some(3)),
             ClaimForkPoolSlot::AtCapacity,
             "dynamic admission may not exceed maxActive"
+        );
+    }
+
+    #[test]
+    fn device_limit_is_shared_across_pools_but_not_across_devices() {
+        let (_dir, db) = temp_db();
+        let mut first = test_pool("first", 1);
+        first.auto_admission = true;
+        let mut second = test_pool("second", 1);
+        second.auto_admission = true;
+        db.insert_fork_pool_if_not_exists(&first).unwrap();
+        db.insert_fork_pool_if_not_exists(&second).unwrap();
+        insert_ready_pool_slot(&db, "first", "first-slot");
+        insert_ready_pool_slot(&db, "second", "second-slot");
+        let limit = Some(ForkPoolAdmissionLimit { pool: 1, device: 1 });
+
+        assert!(matches!(
+            db.claim_fork_pool_slot(ForkPoolSlotClaim {
+                pool_name: "first",
+                lease_id: "first-lease",
+                idempotency_key: "first-request",
+                assignment: &[],
+                payload_sha256: None,
+                require_private_workspace: false,
+                admission_limit: limit,
+                ttl_secs: 60,
+                now: 200,
+            })
+            .unwrap(),
+            ClaimForkPoolSlot::Claimed(_)
+        ));
+        assert_eq!(
+            db.claim_fork_pool_slot(ForkPoolSlotClaim {
+                pool_name: "second",
+                lease_id: "second-lease",
+                idempotency_key: "second-request",
+                assignment: &[],
+                payload_sha256: None,
+                require_private_workspace: false,
+                admission_limit: limit,
+                ttl_secs: 60,
+                now: 201,
+            })
+            .unwrap(),
+            ClaimForkPoolSlot::AtCapacity
+        );
+
+        let (_other_dir, other_db) = temp_db();
+        second.cuda_device_ordinal = Some(1);
+        other_db.insert_fork_pool_if_not_exists(&first).unwrap();
+        other_db.insert_fork_pool_if_not_exists(&second).unwrap();
+        insert_ready_pool_slot(&other_db, "first", "other-first-slot");
+        insert_ready_pool_slot(&other_db, "second", "other-second-slot");
+        for (pool, machine, lease) in [
+            ("first", "other-first-slot", "other-first-lease"),
+            ("second", "other-second-slot", "other-second-lease"),
+        ] {
+            assert!(matches!(
+                other_db
+                    .claim_fork_pool_slot(ForkPoolSlotClaim {
+                        pool_name: pool,
+                        lease_id: lease,
+                        idempotency_key: lease,
+                        assignment: &[],
+                        payload_sha256: None,
+                        require_private_workspace: false,
+                        admission_limit: limit,
+                        ttl_secs: 60,
+                        now: 202,
+                    })
+                    .unwrap(),
+                ClaimForkPoolSlot::Claimed(_)
+            ));
+            assert_eq!(
+                other_db
+                    .get_fork_pool_slot(machine)
+                    .unwrap()
+                    .unwrap()
+                    .lease_id,
+                Some(lease.into())
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_cross_pool_claims_cannot_cross_device_limit() {
+        let (dir, db) = temp_db();
+        let mut first = test_pool("first", 1);
+        first.auto_admission = true;
+        let mut second = test_pool("second", 1);
+        second.auto_admission = true;
+        db.insert_fork_pool_if_not_exists(&first).unwrap();
+        db.insert_fork_pool_if_not_exists(&second).unwrap();
+        insert_ready_pool_slot(&db, "first", "first-slot");
+        insert_ready_pool_slot(&db, "second", "second-slot");
+        drop(db);
+
+        let path = dir.path().join("test.db");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut threads = Vec::new();
+        for (pool, slot) in [("first", "first-slot"), ("second", "second-slot")] {
+            let db = SmolvmDb::open_at(&path).unwrap();
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                db.claim_fork_pool_slot(ForkPoolSlotClaim {
+                    pool_name: pool,
+                    lease_id: slot,
+                    idempotency_key: slot,
+                    assignment: &[],
+                    payload_sha256: None,
+                    require_private_workspace: false,
+                    admission_limit: Some(ForkPoolAdmissionLimit { pool: 1, device: 1 }),
+                    ttl_secs: 60,
+                    now: 200,
+                })
+                .unwrap()
+            }));
+        }
+        let outcomes = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, ClaimForkPoolSlot::Claimed(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, ClaimForkPoolSlot::AtCapacity))
+                .count(),
+            1
         );
     }
 
@@ -2454,6 +2843,39 @@ mod tests {
         assert_eq!(expired[0].state, ForkLeaseState::Expired);
         let retiring = db.list_retiring_fork_pool_slots().unwrap();
         assert_eq!(retiring.len(), 2);
+    }
+
+    #[test]
+    fn fork_lease_ttl_starts_after_activation_completes() {
+        let (_dir, db) = temp_db();
+        db.insert_fork_pool_if_not_exists(&test_pool("rollouts", 1))
+            .unwrap();
+        insert_ready_pool_slot(&db, "rollouts", "slot-delayed");
+        let claimed = db
+            .claim_fork_pool_slot(ForkPoolSlotClaim {
+                pool_name: "rollouts",
+                lease_id: "lease-delayed",
+                idempotency_key: "req-delayed",
+                assignment: &[],
+                payload_sha256: None,
+                require_private_workspace: false,
+                admission_limit: None,
+                ttl_secs: 30,
+                now: 200,
+            })
+            .unwrap();
+        let ClaimForkPoolSlot::Claimed(claimed) = claimed else {
+            panic!("expected claimed lease");
+        };
+        assert_eq!(claimed.expires_at, 500);
+
+        let active = db
+            .mark_fork_lease_active("lease-delayed", 231)
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.expires_at, 261);
+        assert!(db.expire_fork_leases(260).unwrap().is_empty());
+        assert_eq!(db.expire_fork_leases(261).unwrap().len(), 1);
     }
 
     #[test]
